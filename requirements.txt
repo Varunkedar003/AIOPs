@@ -1,0 +1,51 @@
+# Core dependencies
+streamlit>=1.28.0
+python-dotenv>=1.0.0
+streamlit-agraph>=0.0.45
+
+# LangGraph and LLM dependencies
+langgraph>=0.0.40
+langchain>=0.1.0
+langchain-core>=0.1.0
+
+# Ollama integration
+ollama>=0.1.0
+langchain-ollama>=0.1.0
+
+# CrewAI multi-agent investigation layer
+crewai>=1.0.0
+
+# Claude Sonnet integration (final investigation synthesis)
+anthropic>=0.120.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Testing (to be used in later phases)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# Azure SDKs
+azure-identity>=1.14.0
+azure-monitor-query>=1.1.0
+azure-mgmt-resource>=23.0.0
+azure-mgmt-resourcegraph>=8.0.0
+azure-mgmt-monitor>=6.0.0
+azure-mgmt-containerservice>=20.0.0
+azure-mgmt-costmanagement>=5.0.0
+
+# Kubernetes (AKS cluster data - read-only)
+kubernetes>=28.1.0
+
+# GitLab integration (to be used in later phases)
+python-gitlab>=4.0.0
+
+# Async support
+httpx>=0.25.0
+aiohttp>=3.9.0
+requests>=2.31.0
+
+# Documentation generation (Task 24): DOCX/PDF export
+python-docx>=1.1.0
+reportlab>=4.0.0

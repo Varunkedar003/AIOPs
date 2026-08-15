@@ -1,0 +1,1700 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<script src="./cytoscape.min.js"></script>
+<script src="./cytoscape-dagre.js"></script>
+<script src="./cytoscape-expand-collapse.js"></script>
+<script src="./elk.bundled.js"></script>
+<script src="./cytoscape-elk.js"></script>
+<script src="./layout-base.js"></script>
+<script src="./cose-base.js"></script>
+<script src="./cytoscape-fcose.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #0e1117; font-family: "Source Sans Pro", sans-serif; color: #e6e6e6; }
+  #root { display: flex; flex-direction: column; }
+  #toolbar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; align-items: center; background: #11151c; border-bottom: 1px solid #262a34; }
+  #search {
+    flex: 1 1 180px; min-width: 140px; padding: 6px 10px; border-radius: 6px; border: 1px solid #363b47;
+    background: #1c212c; color: #e6e6e6; font-size: 13px; outline: none;
+  }
+  select.tool, button.tool {
+    background: #262a34; color: #e6e6e6; border: 1px solid #363b47; border-radius: 6px;
+    padding: 6px 8px; font-size: 12px; cursor: pointer; max-width: 150px;
+  }
+  button.tool:hover { background: #363b47; }
+  button.tool.active { background: #2E86AB; border-color: #2E86AB; }
+  #cyWrap { position: relative; }
+  #cy { width: 100%; background: #0e1117; }
+  #hint { color: #808495; font-size: 11px; padding: 3px 10px; }
+  #minimap {
+    position: absolute; right: 10px; bottom: 10px; width: 160px; height: 110px;
+    background: rgba(17, 21, 28, 0.9); border: 1px solid #363b47; border-radius: 4px; cursor: pointer;
+  }
+  #tooltip {
+    position: fixed; display: none; z-index: 1000; background: #1c212c; border: 1px solid #363b47;
+    border-radius: 6px; padding: 8px 10px; font-size: 11px; color: #e6e6e6; pointer-events: none;
+    max-width: 270px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  }
+  #tooltip .tip-head { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+  #tooltip .tip-swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+  #tooltip b { color: #ffffff; }
+  #tooltip .row { margin: 1px 0; }
+  #tooltip .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  details.panel { border-top: 1px solid #262a34; background: #11151c; }
+  details.panel > summary {
+    cursor: pointer; padding: 8px 10px; font-size: 13px; font-weight: 600; list-style: none;
+    display: flex; align-items: center; gap: 6px; user-select: none;
+  }
+  details.panel > summary::-webkit-details-marker { display: none; }
+  details.panel > summary:before { content: "▶"; font-size: 10px; transition: transform 0.15s; }
+  details.panel[open] > summary:before { transform: rotate(90deg); }
+  .panel-body { padding: 4px 12px 12px 12px; }
+  .legend-section { margin-bottom: 10px; }
+  .legend-section h4 { margin: 6px 0 4px 0; font-size: 12px; color: #9aa3b2; text-transform: uppercase; letter-spacing: 0.04em; }
+  .legend-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 4px; }
+  .legend-item {
+    display: flex; align-items: flex-start; gap: 6px; padding: 5px 7px; border-radius: 5px;
+    background: #171b24; border: 1px solid transparent; cursor: default; font-size: 11.5px;
+  }
+  .legend-item.clickable { cursor: pointer; }
+  .legend-item.clickable:hover { border-color: #363b47; background: #1c212c; }
+  .legend-item.active-filter { border-color: #2E86AB; background: #142230; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 3px; flex: none; margin-top: 1px; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 50%; flex: none; margin-top: 2px; border: 2px solid; background: transparent; }
+  .legend-text b { display: block; color: #e6e6e6; }
+  .legend-text span { color: #8b93a3; font-size: 10.5px; }
+  .legend-edge-line { width: 26px; height: 0; border-top-width: 2px; border-top-style: solid; margin-top: 6px; flex: none; }
+  #typeDetail { margin-top: 6px; padding: 8px; border-radius: 6px; background: #171b24; border: 1px solid #2E86AB; font-size: 11.5px; display: none; }
+  #playbackBar { display: flex; align-items: center; gap: 8px; }
+  #playbackScrub { flex: 1; }
+  #playbackLabel { font-size: 11px; color: #9aa3b2; min-width: 220px; }
+  #cy:fullscreen, #cyWrap:fullscreen { background: #0e1117; }
+  .lazy-hint { font-size: 11px; color: #6f7893; padding: 2px 10px 0 10px; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div id="toolbar">
+    <input id="search" type="text" placeholder="Search resources by name, type, RG, or subscription..." />
+    <select class="tool" id="filterType"><option value="">All Types</option></select>
+    <select class="tool" id="filterHealth">
+      <option value="">All Health</option>
+      <option value="healthy">Healthy</option>
+      <option value="warning">Warning</option>
+      <option value="offline">Offline</option>
+      <option value="investigating">Investigating</option>
+      <option value="root_cause">Root Cause</option>
+      <option value="dependency">Dependency</option>
+      <option value="not_involved">Not Involved</option>
+    </select>
+    <select class="tool" id="filterRG"><option value="">All Resource Groups</option></select>
+    <select class="tool" id="filterSub"><option value="">All Subscriptions</option></select>
+    <select class="tool" id="layoutSelect" title="Graph layout">
+      <option value="elk">Layout: ELK Layered</option>
+      <option value="dagre">Layout: Dagre</option>
+      <option value="fcose">Layout: FCose</option>
+      <option value="concentric">Layout: Concentric</option>
+      <optgroup label="Advanced (debug)">
+        <option value="breadthfirst">Tree</option>
+        <option value="cose">Force (Cose)</option>
+        <option value="grid">Grid</option>
+        <option value="circle">Circle</option>
+      </optgroup>
+    </select>
+    <button class="tool" id="zoomIn" title="Zoom in">Zoom +</button>
+    <button class="tool" id="zoomOut" title="Zoom out">Zoom -</button>
+    <button class="tool" id="fit" title="Fit whole graph">Fit</button>
+    <button class="tool" id="zoomAffected" title="Zoom to nodes involved in the current investigation">Zoom to Affected</button>
+    <button class="tool" id="fitInvestigation" title="Fit view to the current investigation">Fit Investigation</button>
+    <button class="tool" id="toggleCollapse" title="Show only the selected resource and its direct dependencies">Collapse Deps</button>
+    <button class="tool" id="expandAll" title="Expand every collapsed resource group">Expand All</button>
+    <button class="tool" id="collapseAll" title="Collapse resource groups back to their first few resources">Collapse All</button>
+    <button class="tool" id="toggleMinimap" title="Show/hide mini map">Mini Map</button>
+    <button class="tool" id="toggleFullscreen" title="Full screen">Full Screen</button>
+  </div>
+  <div id="cyWrap">
+    <div id="cy"></div>
+    <canvas id="minimap" width="160" height="110"></canvas>
+    <div id="tooltip"></div>
+  </div>
+  <div id="hint">Drag nodes to rearrange &middot; scroll or pinch to zoom &middot; drag background to pan &middot; click a node to open its AI side panel &middot; click a resource group to expand/collapse it &middot; hover for details</div>
+  <div class="lazy-hint" id="lazyHint" style="display:none;"></div>
+
+  <details class="panel" id="legendPanel">
+    <summary>📖 Graph Legend</summary>
+    <div class="panel-body">
+      <div class="legend-section">
+        <h4>Node States</h4>
+        <div class="legend-grid" id="nodeStateLegend"></div>
+      </div>
+      <div class="legend-section">
+        <h4>Edge Styles</h4>
+        <div class="legend-grid" id="edgeStyleLegend"></div>
+      </div>
+      <div class="legend-section">
+        <h4>Resource Types on this graph (click to highlight &amp; filter)</h4>
+        <div class="legend-grid" id="resourceTypeLegend"></div>
+        <div id="typeDetail"></div>
+      </div>
+    </div>
+  </details>
+
+  <details class="panel" id="playbackPanel">
+    <summary>⏱ Investigation Playback</summary>
+    <div class="panel-body">
+      <div id="playbackBar">
+        <button class="tool" id="playbackPlay">▶ Play</button>
+        <button class="tool" id="playbackPrev">⏮ Prev</button>
+        <button class="tool" id="playbackNext">Next ⏭</button>
+        <input type="range" id="playbackScrub" min="0" max="0" value="0" />
+        <span id="playbackLabel">No investigation events recorded yet.</span>
+      </div>
+    </div>
+  </details>
+</div>
+
+<script>
+// --- Minimal vanilla-JS implementation of the Streamlit Components protocol ---
+// (no streamlit-component-lib / build step required)
+function sendMessageToStreamlit(type, data) {
+  var outData = Object.assign({ isStreamlitMessage: true, type: type }, data);
+  window.parent.postMessage(outData, "*");
+}
+
+function initStreamlit() {
+  sendMessageToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+}
+
+function setFrameHeight(height) {
+  sendMessageToStreamlit("streamlit:setFrameHeight", { height: height });
+}
+
+function setComponentValue(value) {
+  sendMessageToStreamlit("streamlit:setComponentValue", { value: value });
+}
+
+var renderHandlers = [];
+function onRender(fn) { renderHandlers.push(fn); }
+
+window.addEventListener("message", function(event) {
+  if (event.data.type === "streamlit:render") {
+    renderHandlers.forEach(function(fn) { fn(event.data.args || {}); });
+  }
+});
+
+function updateFrameHeight() {
+  var h = document.getElementById("root").scrollHeight;
+  setFrameHeight(h + 4);
+}
+
+// cytoscape-dagre self-registers against window.cytoscape on load; cytoscape-expand-collapse
+// does not, so it needs an explicit cytoscape.use() before any cy.expandCollapse(...) call.
+if (typeof cytoscape !== "undefined" && typeof cytoscapeExpandCollapse !== "undefined") {
+  cytoscape.use(cytoscapeExpandCollapse);
+}
+
+// --- Resource type catalogue (curated) --------------------------------------------------------
+// Colors/icons for types the backend is known to emit. Anything the graph sees that isn't
+// listed here (most raw Azure ARM "type" strings, e.g. "microsoft.web/sites") is resolved by
+// normalizeType()/typeMeta() below instead of falling back to a single gray "unknown" bucket.
+var RESOURCE_TYPES = [
+  { key: "subscription", name: "Subscription", color: "#2E86AB", icon: "🏢",
+    description: "The Azure billing/management boundary containing all resource groups.",
+    purpose: "Top-level container for cost, access, and policy scope.",
+    relationships: "Contains Resource Groups." },
+  { key: "resource_group", name: "Resource Group", color: "#A23B72", icon: "📁",
+    description: "A logical container for related Azure resources.",
+    purpose: "Groups resources that share a lifecycle for deployment/management.",
+    relationships: "Contained by Subscription; contains most other Azure resource types." },
+  { key: "app_service_plan", name: "App Service Plan", color: "#D4A017", icon: "📐",
+    description: "The compute tier (SKU, scaling) that App Services run on.",
+    purpose: "Defines CPU/memory/scale-out capacity shared by one or more App Services.",
+    relationships: "Hosts one or more App Services." },
+  { key: "app_service", name: "App Service", color: "#C73E1D", icon: "🌐",
+    description: "A managed web app / API endpoint.",
+    purpose: "Runs application code without managing the underlying VM.",
+    relationships: "Runs on an App Service Plan; monitored by Application Insights; deploys from GitLab Pipelines." },
+  { key: "aks_cluster", name: "AKS Cluster", color: "#F18F01", icon: "☸️",
+    description: "A managed Kubernetes cluster.",
+    purpose: "Orchestrates containerized workloads (Node Pools, Namespaces, Pods).",
+    relationships: "Contains Node Pools and Namespaces; hosts Deployments/Pods/Services/Ingress." },
+  { key: "node_pool", name: "Node Pool", color: "#8E44AD", icon: "🧩",
+    description: "A group of identically-configured VM nodes within an AKS cluster.",
+    purpose: "Provides the compute capacity Kubernetes schedules Pods onto.",
+    relationships: "Part of an AKS Cluster; runs Pods." },
+  { key: "namespace", name: "Namespace", color: "#16A085", icon: "🗂️",
+    description: "A Kubernetes logical partition within a cluster.",
+    purpose: "Isolates and organizes Deployments/Pods/Services by team or environment.",
+    relationships: "Part of an AKS Cluster; contains Deployments, Pods, Services, Ingress." },
+  { key: "deployment", name: "Deployment", color: "#3B1F2B", icon: "🚀",
+    description: "A Kubernetes controller that manages a replicated set of Pods.",
+    purpose: "Declares desired state and rollout strategy for an application.",
+    relationships: "Runs inside a Namespace; manages Pods; fronted by a Service." },
+  { key: "pod", name: "Pod", color: "#28A745", icon: "📦",
+    description: "The smallest deployable Kubernetes unit (one or more containers).",
+    purpose: "Runs the actual application container(s).",
+    relationships: "Created by a Deployment; runs on a Node Pool; exposed by a Service." },
+  { key: "service", name: "Service", color: "#17A2B8", icon: "🔗",
+    description: "A stable network endpoint for a set of Pods.",
+    purpose: "Load-balances traffic to Pods regardless of Pod churn.",
+    relationships: "Selects Pods; exposed externally via Ingress." },
+  { key: "ingress", name: "Ingress", color: "#6610F2", icon: "🌍",
+    description: "HTTP(S) routing rules into the cluster.",
+    purpose: "Exposes Services to the internet with host/path routing and TLS.",
+    relationships: "Routes to one or more Services; often fronted by a Load Balancer." },
+  { key: "container_registry", name: "ACR (Container Registry)", color: "#2C3E50", icon: "🏗️",
+    description: "Azure Container Registry storing container images.",
+    purpose: "Stores and serves the images AKS Deployments/Pods run.",
+    relationships: "Pulled from by AKS Node Pools/Pods; pushed to by GitLab Pipelines." },
+  { key: "sql_database", name: "Azure SQL", color: "#06A77D", icon: "🗄️",
+    description: "A managed relational database.",
+    purpose: "Persists application data.",
+    relationships: "Used by App Services / Deployments; monitored via Azure Monitor." },
+  { key: "storage_account", name: "Storage Account", color: "#6C757D", icon: "💾",
+    description: "Blob/file/queue/table storage.",
+    purpose: "General-purpose durable storage for app data, logs, and artifacts.",
+    relationships: "Used by App Services, Deployments, and Log Analytics." },
+  { key: "key_vault", name: "Key Vault", color: "#991B1B", icon: "🔐",
+    description: "Secure store for secrets, keys, and certificates.",
+    purpose: "Centralizes credential management so secrets aren't hard-coded.",
+    relationships: "Referenced by App Services, AKS workloads, and Pipelines." },
+  { key: "redis", name: "Redis", color: "#59C3C3", icon: "⚡",
+    description: "Managed in-memory cache/data store.",
+    purpose: "Reduces database load and speeds up hot-path reads.",
+    relationships: "Used by App Services / Deployments." },
+  { key: "application_insights", name: "Application Insights", color: "#7B2D8E", icon: "📊",
+    description: "APM telemetry for requests, dependencies, and exceptions.",
+    purpose: "Provides the traces/metrics the AI investigation reads for evidence.",
+    relationships: "Monitors App Services and AKS workloads; feeds Azure Monitor alerts." },
+  { key: "log_analytics", name: "Log Analytics", color: "#1F77B4", icon: "📋",
+    description: "Centralized log query workspace (KQL).",
+    purpose: "Aggregates logs from AKS, App Services, and infra for querying/alerting.",
+    relationships: "Collects from most Azure resource types; backs Azure Monitor alerts." },
+  { key: "azure_monitor", name: "Azure Monitor", color: "#3498DB", icon: "📈",
+    description: "Platform metrics, alerts, and dashboards.",
+    purpose: "Triggers alerts and surfaces health signals used by the investigation.",
+    relationships: "Watches most resource types; reads from Log Analytics/App Insights." },
+  { key: "vnet", name: "VNet", color: "#27AE60", icon: "🕸️",
+    description: "Azure Virtual Network - the private network boundary.",
+    purpose: "Provides isolated, routable network space for resources.",
+    relationships: "Contains subnets used by AKS, App Services (VNet integration), Load Balancers." },
+  { key: "nsg", name: "NSG", color: "#C0392B", icon: "🛡️",
+    description: "Network Security Group - stateful traffic filter rules.",
+    purpose: "Allows/denies inbound and outbound traffic at the subnet/NIC level.",
+    relationships: "Attached to VNets/subnets; guards AKS and App Service traffic." },
+  { key: "load_balancer", name: "Load Balancer", color: "#E67E22", icon: "⚖️",
+    description: "Distributes traffic across backend instances.",
+    purpose: "Provides a single front-end IP/port with health-probed backend routing.",
+    relationships: "Fronts AKS Ingress / App Services; uses a Public IP." },
+  { key: "public_ip", name: "Public IP", color: "#2980B9", icon: "📡",
+    description: "A public-facing IP address resource.",
+    purpose: "Gives a Load Balancer, App Service, or Ingress internet reachability.",
+    relationships: "Attached to a Load Balancer or Ingress." },
+  { key: "virtual_machine", name: "Virtual Machine", color: "#0F6FC5", icon: "🖥️",
+    description: "An Azure IaaS virtual machine.",
+    purpose: "Runs workloads that need full OS-level control.",
+    relationships: "Attached to a VNet/NIC; may sit behind a Load Balancer." },
+  { key: "gitlab_project", name: "GitLab Project", color: "#FC6D26", icon: "🦊",
+    description: "A GitLab repository/project.",
+    purpose: "Source of truth for code, CI/CD pipelines, and merge requests.",
+    relationships: "Contains Pipelines, Commits, and Merge Requests; deploys to Azure resources." },
+  { key: "pipeline", name: "Pipeline", color: "#E24329", icon: "⚙️",
+    description: "A GitLab CI/CD pipeline run.",
+    purpose: "Builds, tests, and deploys the project on each commit/MR.",
+    relationships: "Belongs to a GitLab Project; made of Jobs; triggered by a Commit." },
+  { key: "job", name: "Job", color: "#FCA326", icon: "🔩",
+    description: "A single stage/step within a pipeline (build, test, deploy...).",
+    purpose: "Executes one unit of CI/CD work; failures are the primary investigation entry point.",
+    relationships: "Part of a Pipeline." },
+  { key: "commit", name: "Commit", color: "#6E49CB", icon: "📝",
+    description: "A single Git commit.",
+    purpose: "The unit of change correlated against failed pipelines/deployments.",
+    relationships: "Triggers Pipelines; part of a Merge Request." },
+  { key: "merge_request", name: "Merge Request", color: "#554488", icon: "🔀",
+    description: "A GitLab merge/pull request.",
+    purpose: "Groups commits under review before merging; carries approvals and discussion.",
+    relationships: "Contains Commits; triggers Pipelines on the source branch." },
+  { key: "unknown", name: "Unknown", color: "#95A5A6", icon: "❔",
+    description: "Resource type could not be determined (e.g. a dangling reference Azure never returned).",
+    purpose: "", relationships: "" }
+];
+
+var RESOURCE_TYPE_BY_KEY = {};
+RESOURCE_TYPES.forEach(function(t) { RESOURCE_TYPE_BY_KEY[t.key] = t; });
+var SELECTED_COLOR = "#FF6B6B";
+var DEFAULT_COLOR = "#95A5A6";
+
+// --- ARM "type" string normalization -----------------------------------------------------------
+// Azure Resource Graph hands back raw ARM type strings (e.g. "microsoft.web/sites"), not the
+// curated snake_case keys above. Map the common ones onto a curated entry; anything else still
+// gets a stable, unique color/icon derived from the raw string instead of a shared gray default.
+var ARM_TYPE_RULES = [
+  { match: "microsoft.resources/resourcegroups", key: "resource_group" },
+  { match: "microsoft.web/serverfarms", key: "app_service_plan" },
+  { match: "microsoft.web/sites", key: "app_service" },
+  { match: "microsoft.containerservice/managedclusters", key: "aks_cluster" },
+  { match: "microsoft.containerregistry/registries", key: "container_registry" },
+  { match: "microsoft.sql/", key: "sql_database" },
+  { match: "microsoft.dbforpostgresql/", key: "sql_database" },
+  { match: "microsoft.dbformysql/", key: "sql_database" },
+  { match: "microsoft.documentdb/", key: "sql_database" },
+  { match: "microsoft.cache/redis", key: "redis" },
+  { match: "microsoft.storage/storageaccounts", key: "storage_account" },
+  { match: "microsoft.keyvault/vaults", key: "key_vault" },
+  { match: "microsoft.insights/components", key: "application_insights" },
+  { match: "microsoft.operationalinsights/workspaces", key: "log_analytics" },
+  { match: "microsoft.insights/", key: "azure_monitor" },
+  { match: "microsoft.network/virtualnetworks", key: "vnet" },
+  { match: "microsoft.network/networksecuritygroups", key: "nsg" },
+  { match: "microsoft.network/loadbalancers", key: "load_balancer" },
+  { match: "microsoft.network/publicipaddresses", key: "public_ip" },
+  { match: "microsoft.compute/virtualmachines", key: "virtual_machine" },
+  { match: "microsoft.compute/", key: "virtual_machine" }
+];
+
+function matchArmType(lowerKey) {
+  for (var i = 0; i < ARM_TYPE_RULES.length; i++) {
+    if (lowerKey.indexOf(ARM_TYPE_RULES[i].match) !== -1) return ARM_TYPE_RULES[i];
+  }
+  return null;
+}
+
+function prettyTypeName(rawType) {
+  var seg = (rawType || "").split("/").pop() || rawType || "Unknown";
+  seg = seg.replace(/[-_]/g, " ");
+  return seg.replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+}
+
+// Simple, stable string hash -> HSL color so any resource type the graph encounters (even ones
+// nobody anticipated) gets its own distinct, consistent color rather than sharing DEFAULT_COLOR.
+function hashColor(str) {
+  var hash = 0;
+  for (var i = 0; i < str.length; i++) { hash = (hash * 31 + str.charCodeAt(i)) >>> 0; }
+  var hue = hash % 360;
+  return "hsl(" + hue + ", 60%, 50%)";
+}
+
+var _typeMetaCache = {};
+function typeMeta(rawType) {
+  var lowerKey = (rawType || "unknown").toLowerCase();
+  if (_typeMetaCache[lowerKey]) return _typeMetaCache[lowerKey];
+
+  var meta;
+  if (RESOURCE_TYPE_BY_KEY[lowerKey]) {
+    meta = Object.assign({ curated: true }, RESOURCE_TYPE_BY_KEY[lowerKey]);
+  } else {
+    var rule = matchArmType(lowerKey);
+    if (rule && RESOURCE_TYPE_BY_KEY[rule.key]) {
+      meta = Object.assign({ curated: true }, RESOURCE_TYPE_BY_KEY[rule.key]);
+    } else if (lowerKey === "unknown" || lowerKey === "") {
+      meta = Object.assign({ curated: true }, RESOURCE_TYPE_BY_KEY.unknown);
+    } else {
+      meta = {
+        key: lowerKey,
+        name: prettyTypeName(rawType),
+        icon: "◆",
+        color: hashColor(lowerKey),
+        curated: false,
+        description: "Azure resource type: " + rawType,
+        purpose: "",
+        relationships: ""
+      };
+    }
+  }
+  _typeMetaCache[lowerKey] = meta;
+  return meta;
+}
+
+// --- Node state / edge style catalogue ---------------------------------------------------------
+var NODE_STATES = [
+  { key: "healthy", label: "Healthy", color: "#2ecc71", description: "Operating normally, no active investigation." },
+  { key: "investigating", label: "Investigating", color: "#3498db", description: "LangGraph/CrewAI/Claude are actively analyzing this resource." },
+  { key: "warning", label: "Warning", color: "#f1c40f", description: "Degraded health or active alerts, not yet investigated." },
+  { key: "root_cause", label: "Root Cause", color: "#e74c3c", description: "The AI investigation identified this resource as the root cause." },
+  { key: "dependency", label: "Dependency", color: "#9b59b6", description: "A direct dependency of the resource currently being investigated." },
+  { key: "not_involved", label: "Not Involved", color: "#5c6370", description: "Outside the scope of the current investigation." },
+  { key: "offline", label: "Offline", color: "#7f1d1d", description: "Stopped, failed, or unreachable." }
+];
+var NODE_STATE_META = {};
+NODE_STATES.forEach(function(s) { NODE_STATE_META[s.key] = s; });
+
+// Small text badges layered onto the label (not baked into the icon image, and never used to
+// recolor the node face) so health/investigation state stays visible without touching the
+// per-type color/icon.
+var STATE_BADGE = {
+  warning: "⚠", offline: "⛔", root_cause: "🎯", investigating: "🔎", dependency: "🔗"
+};
+
+var EDGE_STYLES = [
+  { key: "normal", label: "Dependency", color: "#4a4f5c", dashed: false, description: "A normal, at-rest resource dependency." },
+  { key: "active_investigation", label: "Active Investigation", color: "#3498db", dashed: true, description: "This link is being actively traced by the running investigation (animated)." },
+  { key: "root_cause_path", label: "Root Cause Path", color: "#e74c3c", dashed: true, description: "This link connects the investigated resource to its identified root cause." },
+  { key: "impact_path", label: "Impact Path", color: "#f39c12", dashed: false, description: "This link was involved in a completed investigation's blast radius." },
+  { key: "related", label: "Related", color: "#9b59b6", dashed: true, description: "A softer relationship surfaced by the legend/related-resources view." }
+];
+var EDGE_STYLE_META = {};
+EDGE_STYLES.forEach(function(s) { EDGE_STYLE_META[s.key] = s; });
+
+function healthBorder(status) {
+  var s = (status || "").toLowerCase();
+  if (["critical", "error", "failed", "stopped", "offline", "unavailable"].includes(s)) return "#e74c3c";
+  if (["warning", "degraded", "unhealthy"].includes(s)) return "#f1c40f";
+  return "#2ecc71";
+}
+
+function nodeStateColor(state) {
+  return (NODE_STATE_META[state] || {}).color || healthBorder(state);
+}
+
+// --- Per-type icon tiles (Azure-style: colored rounded square + glyph), canvas-generated and
+// cached so the (cheap but non-zero) drawing cost is paid once per distinct type, not per node. --
+var _nodeImageCache = {};
+function roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function getNodeImage(meta) {
+  if (_nodeImageCache[meta.key]) return _nodeImageCache[meta.key];
+  var size = 64;
+  var canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  var ctx = canvas.getContext("2d");
+
+  ctx.fillStyle = meta.color;
+  roundRectPath(ctx, 3, 3, size - 6, size - 6, 14);
+  ctx.fill();
+
+  ctx.font = "32px 'Segoe UI Emoji','Segoe UI Symbol',sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(meta.icon || "◆", size / 2, size / 2 + 2);
+
+  var url = canvas.toDataURL("image/png");
+  _nodeImageCache[meta.key] = url;
+  return url;
+}
+
+// --- Cytoscape graph rendering -----------------------------------------------------------------
+var cy = null;
+var lastArgsKey = null;
+var lastSelectedId = null;
+var lastNodes = [];
+var lastEdges = [];
+var lastNodeStates = {};
+var lastEdgeStyles = {};
+var lastEvents = [];
+var graphHeight = 600;
+var collapsedToDependencies = false;
+var minimapVisible = true;
+var activeTypeFilter = "";
+var lastStatesKey = null;
+
+var viewMode = "explorer"; // "explorer" (full subscription topology) | "workspace" (depth-1, centered)
+
+// Resource-group grouping / expand-collapse state (frontend-only; the backend keeps sending
+// the full node set every render - resources are actual compound children of their resource
+// group, never removed, just collapsed/expanded via cytoscape-expand-collapse).
+var expandCollapseApi = null;
+var syntheticSubscriptionId = null;
+var nodeTypeById = {};
+var rgParentOf = {}; // resourceId -> its resource group's node id (one level only; set in buildElements)
+var AUTO_COLLAPSE_NODE_THRESHOLD = 25; // large graphs start with resource groups collapsed
+var LARGE_GRAPH_NODE_THRESHOLD = 300;  // >300 nodes: ELK; between the two thresholds: FCose
+var LAYOUT_STORAGE_KEY = "cytoscape_topology_layout_preference_v1";
+
+function getStoredLayoutPreference() {
+  try {
+    return window.localStorage.getItem(LAYOUT_STORAGE_KEY) || null;
+  } catch (e) {
+    return null; // localStorage can be unavailable (privacy mode, sandboxed iframe, etc.)
+  }
+}
+
+function setStoredLayoutPreference(name) {
+  try {
+    window.localStorage.setItem(LAYOUT_STORAGE_KEY, name);
+  } catch (e) { /* best-effort only */ }
+}
+
+// Large graphs -> ELK (preferred, handles scale/hierarchy well); medium graphs -> FCose
+// (force-directed, reads better at moderate node counts); small graphs default to ELK too
+// since it's the general Infrastructure Explorer default either way.
+function autoSelectLayoutName(nodeCount) {
+  if (nodeCount > LARGE_GRAPH_NODE_THRESHOLD) return "elk";
+  if (nodeCount > AUTO_COLLAPSE_NODE_THRESHOLD) return "fcose";
+  return "elk";
+}
+
+// Applies the user's remembered layout choice if one exists, else auto-selects by graph size.
+// Only meaningful for the explorer view - the workspace view always forces "concentric-radial"
+// (see currentLayoutName()) regardless of this dropdown's value.
+function applyInitialLayoutSelection(nodeCount) {
+  var sel = document.getElementById("layoutSelect");
+  if (!sel) return;
+  var validValues = Array.prototype.map.call(sel.querySelectorAll("option"), function(o) { return o.value; });
+  var stored = getStoredLayoutPreference();
+  sel.value = (stored && validValues.indexOf(stored) !== -1) ? stored : autoSelectLayoutName(nodeCount);
+}
+
+// cytoscape-expand-collapse detaches a collapsed compound's descendants from the graph model
+// entirely (they're not just hidden) - cy.nodes()/cy.getElementById() won't find them until
+// expanded. Anything that needs to survive that (the initially-selected/investigated resource,
+// search matches) has to resolve via lastNodes/rgParentOf and expand ancestors first.
+function resourceGroupIdFor(nodeId) {
+  if (typeMeta(nodeTypeById[nodeId] || "").key === "resource_group") return nodeId;
+  var p = rgParentOf[nodeId];
+  return (p && p !== syntheticSubscriptionId) ? p : undefined;
+}
+
+function computeKeepExpandedRgIds(selectedId, nodeStates) {
+  var ids = {};
+  if (selectedId) {
+    var rg = resourceGroupIdFor(selectedId);
+    if (rg) ids[rg] = true;
+  }
+  Object.keys(nodeStates || {}).forEach(function(nodeId) {
+    var state = nodeStates[nodeId];
+    if (state && state !== "not_involved" && state !== "healthy") {
+      var rg = resourceGroupIdFor(nodeId);
+      if (rg) ids[rg] = true;
+    }
+  });
+  return Object.keys(ids);
+}
+
+function isResourceGroupNode(n) { return typeMeta(n.data("type")).key === "resource_group"; }
+function resourceGroupNodes() { return cy ? cy.nodes().filter(isResourceGroupNode) : []; }
+
+// Zoom-based label visibility.
+var LABEL_ZOOM_THRESHOLD = 0.85;
+var showLabelsGlobally = false;
+
+function edgeKey(source, target) { return source + "->" + target; }
+
+function mostCommon(values) {
+  var counts = {};
+  var best = null, bestCount = 0;
+  values.forEach(function(v) {
+    if (!v) return;
+    counts[v] = (counts[v] || 0) + 1;
+    if (counts[v] > bestCount) { bestCount = counts[v]; best = v; }
+  });
+  return best;
+}
+
+function buildElements(nodes, edges, selectedId, nodeStates) {
+  var elements = [];
+  var existingNodeIds = {};
+  nodeTypeById = {};
+  var resourceGroupIds = [];
+  var subscriptionLabels = [];
+
+  nodes.forEach(function(n) {
+    var id = n.id || n.resource_id;
+    if (!id) return;
+    existingNodeIds[id] = true;
+    var meta = typeMeta(n.type);
+    nodeTypeById[id] = n.type || "unknown";
+    if (meta.key === "resource_group") resourceGroupIds.push(id);
+    if (n.subscription || n.subscription_id) subscriptionLabels.push(n.subscription || n.subscription_id);
+  });
+
+  // Resource-group grouping: every resource becomes a compound CHILD of its resource group
+  // (never removed - just visually nested, and collapsible via cytoscape-expand-collapse). Only
+  // direct RG->resource "contains" edges establish nesting; other relationships ("hosted by",
+  // "vnet integration", etc.) stay as plain edges so compounds don't nest more than one level.
+  rgParentOf = {};
+  edges.forEach(function(e) {
+    if ((e.relationship || "").toLowerCase() === "contains" && resourceGroupIds.indexOf(e.source) !== -1) {
+      rgParentOf[e.target] = e.source;
+    }
+  });
+
+  // Synthetic subscription root (frontend-only, never sent back to Streamlit): the backend's
+  // topology has no single top-level "subscription" node, but grouping resources under their
+  // resource group reads better with one top-level container above the resource groups too.
+  syntheticSubscriptionId = null;
+  if (viewMode === "explorer" && resourceGroupIds.length) {
+    syntheticSubscriptionId = "__synthetic_subscription__";
+    resourceGroupIds.forEach(function(rgId) { rgParentOf[rgId] = syntheticSubscriptionId; });
+  }
+
+  var descendantCount = {};
+  Object.keys(rgParentOf).forEach(function(childId) {
+    var parentId = rgParentOf[childId];
+    descendantCount[parentId] = (descendantCount[parentId] || 0) + 1;
+  });
+
+  nodes.forEach(function(n) {
+    var id = n.id || n.resource_id;
+    if (!id) return;
+    var state = (nodeStates || {})[id];
+    elements.push({
+      data: {
+        id: id,
+        label: n.name || id,
+        type: n.type || "unknown",
+        health: n.health_status || "Unknown",
+        state: state || "",
+        resource_group: n.resource_group || "",
+        subscription: n.subscription || n.subscription_id || "",
+        region: n.region || n.location || "",
+        health_score: (n.health_score === undefined || n.health_score === null) ? "" : n.health_score,
+        monthly_cost: (n.monthly_cost === undefined || n.monthly_cost === null) ? "" : n.monthly_cost,
+        last_deployment: n.last_deployment || n.last_deployed_at || "",
+        parent: rgParentOf[id],
+        descendantCount: descendantCount[id] || 0
+      },
+      classes: id === selectedId ? "selected" : ""
+    });
+  });
+
+  if (syntheticSubscriptionId) {
+    var subLabel = mostCommon(subscriptionLabels) || "Subscription";
+    elements.push({
+      data: {
+        id: syntheticSubscriptionId, label: subLabel, type: "subscription", health: "Unknown", state: "",
+        synthetic: true, descendantCount: descendantCount[syntheticSubscriptionId] || 0
+      },
+      classes: "synthetic-root"
+    });
+  }
+
+  // Validation before rendering: Cytoscape.js throws ("Can not create edge with
+  // non-existent target") if an edge references a node id that was never added above - never
+  // let that reach cy.add()/cytoscape({elements: ...}). Any edge with a missing endpoint is
+  // dropped here and logged so the underlying missing Azure relationship can be investigated.
+  // Also drop RG->resource "contains" edges now that the same relationship is shown via compound
+  // nesting instead - an explicit line would just duplicate the group boundary.
+  var skippedEdges = [];
+  edges.forEach(function(e, idx) {
+    if (!e || !(e.source in existingNodeIds) || !(e.target in existingNodeIds)) {
+      skippedEdges.push(e);
+      return;
+    }
+    if (rgParentOf[e.target] === e.source) return;
+    var style = (lastEdgeStyles || {})[edgeKey(e.source, e.target)];
+    elements.push({
+      data: {
+        id: "edge-" + idx,
+        source: e.source,
+        target: e.target,
+        relationship: e.relationship || "",
+        label: e.relationship || "",
+        style: style || "normal"
+      }
+    });
+  });
+  if (skippedEdges.length) {
+    console.warn(
+      "cytoscape_topology: skipped " + skippedEdges.length + " edge(s) referencing a missing node",
+      skippedEdges
+    );
+  }
+
+  return elements;
+}
+
+// --- Resource-group expand/collapse (cytoscape-expand-collapse; nothing is ever removed from
+// the graph model, only visually collapsed) --------------------------------------------------
+function initExpandCollapse() {
+  // Re-initializing after cy.elements().remove()+cy.add() (a full node/edge-set rebuild) is
+  // intentional - any previously-tracked collapsed-node state referenced elements that no
+  // longer exist. Falls back to just fetching the existing API if re-init isn't allowed.
+  try {
+    expandCollapseApi = cy.expandCollapse({ fisheye: false, animate: true, undoable: false, cueEnabled: false });
+  } catch (e) {
+    expandCollapseApi = cy.expandCollapse("get");
+  }
+}
+
+function autoCollapseIfLarge(nodeCount, keepExpandedRgIds) {
+  if (!cy || !expandCollapseApi) return;
+  if (nodeCount <= AUTO_COLLAPSE_NODE_THRESHOLD) return;
+  var keep = {};
+  (keepExpandedRgIds || []).forEach(function(id) { keep[id] = true; });
+  var toCollapse = resourceGroupNodes().filter(function(n) { return !keep[n.id()]; });
+  expandCollapseApi.collapse(toCollapse);
+}
+
+function toggleGroupNode(node) {
+  if (!expandCollapseApi) return false;
+  if (expandCollapseApi.isExpandable(node)) {
+    expandCollapseApi.expand(node);
+  } else if (expandCollapseApi.isCollapsible(node)) {
+    expandCollapseApi.collapse(node);
+  } else {
+    return false;
+  }
+  runLayout(true);
+  return true;
+}
+
+document.getElementById("expandAll").addEventListener("click", function() {
+  if (!expandCollapseApi) return;
+  expandCollapseApi.expand(resourceGroupNodes());
+  runLayout(true);
+});
+document.getElementById("collapseAll").addEventListener("click", function() {
+  if (!expandCollapseApi) return;
+  expandCollapseApi.collapse(resourceGroupNodes());
+  runLayout(true);
+});
+
+// --- Layout ---------------------------------------------------------------------------------------
+function computeHopDistances(centerId) {
+  var dist = {};
+  if (!cy || !centerId) return dist;
+  dist[centerId] = 0;
+  var frontier = [centerId];
+  var guard = 0;
+  while (frontier.length && guard < 20) {
+    guard++;
+    var next = [];
+    frontier.forEach(function(id) {
+      var node = cy.getElementById(id);
+      if (node.empty()) return;
+      node.neighborhood("node").forEach(function(nb) {
+        var nid = nb.id();
+        if (dist[nid] === undefined) { dist[nid] = dist[id] + 1; next.push(nid); }
+      });
+    });
+    frontier = next;
+  }
+  return dist;
+}
+
+function getLayoutOptions(name, animate) {
+  var base = { animate: !!animate, animationDuration: 300, padding: 40, fit: true };
+  if (name === "elk") {
+    // cytoscape-elk/elkjs run async (a Promise internally) - runLayout() below waits on the
+    // "layoutstop" event rather than assuming positions are set the instant .run() returns.
+    return Object.assign({}, base, {
+      name: "elk",
+      elk: {
+        algorithm: "layered",
+        "elk.direction": "DOWN",
+        "elk.spacing.nodeNode": 45,
+        "elk.layered.spacing.nodeNodeBetweenLayers": 90,
+        "elk.spacing.edgeNode": 20,
+        "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX"
+      }
+    });
+  }
+  if (name === "fcose") {
+    return Object.assign({}, base, {
+      name: "fcose",
+      quality: "default",
+      randomize: true,
+      nodeSeparation: 75,
+      idealEdgeLength: 80,
+      nodeRepulsion: 4500,
+      avoidOverlap: true
+    });
+  }
+  if (name === "dagre") {
+    return Object.assign({}, base, {
+      name: "dagre",
+      rankDir: "TB",
+      nodeSep: 45,
+      rankSep: 90,
+      edgeSep: 15,
+      ranker: "network-simplex",
+      fit: true
+    });
+  }
+  if (name === "breadthfirst") {
+    var roots = syntheticSubscriptionId ? [syntheticSubscriptionId] :
+      cy.nodes().filter(function(n) { return typeMeta(n.data("type")).key === "resource_group"; });
+    return Object.assign({}, base, {
+      name: "breadthfirst",
+      directed: true,
+      roots: roots,
+      spacingFactor: 1.5,
+      avoidOverlap: true,
+      nodeDimensionsIncludeLabels: true,
+      grid: false
+    });
+  }
+  if (name === "concentric-radial") {
+    var dist = computeHopDistances(lastSelectedId);
+    return Object.assign({}, base, {
+      name: "concentric",
+      concentric: function(node) {
+        var d = dist[node.id()];
+        return d === undefined ? 0 : (100 - d * 10);
+      },
+      levelWidth: function() { return 1; },
+      minNodeSpacing: 55,
+      avoidOverlap: true,
+      equidistant: true,
+      startAngle: (3 / 2) * Math.PI
+    });
+  }
+  if (name === "concentric") {
+    return Object.assign({}, base, {
+      name: "concentric",
+      concentric: function(node) { return node.degree(); },
+      levelWidth: function() { return 2; },
+      minNodeSpacing: 45,
+      avoidOverlap: true
+    });
+  }
+  if (name === "cose") {
+    return Object.assign({}, base, { name: "cose", nodeOverlap: 20, idealEdgeLength: 90, animate: false });
+  }
+  // grid / circle and anything else fall through to cytoscape's own defaults for that name.
+  return Object.assign({}, base, { name: name, avoidOverlap: true });
+}
+
+function currentLayoutName() {
+  if (viewMode === "workspace") return "concentric-radial";
+  var sel = document.getElementById("layoutSelect");
+  return (sel && sel.value) || "elk";
+}
+
+function runLayout(animate) {
+  if (!cy) return;
+  var visibleEles = cy.elements(":visible");
+  var layout = visibleEles.layout(getLayoutOptions(currentLayoutName(), animate));
+  // elk/fcose can finish asynchronously (a worker/promise internally) - "layoutstop" fires
+  // exactly when positions are actually final, unlike code placed right after .run().
+  layout.one("layoutstop", function() {
+    if (viewMode === "workspace") centerOnSelected();
+    scheduleMinimapDraw();
+  });
+  layout.run();
+}
+
+function centerOnSelected() {
+  if (!cy || !lastSelectedId) return;
+  var n = cy.getElementById(lastSelectedId);
+  if (!n.empty()) cy.center(n);
+}
+
+// --- Stylesheet -------------------------------------------------------------------------------
+function nodeLabel(el) {
+  var base = el.data("label");
+  var badge = STATE_BADGE[el.data("state")];
+  return (badge ? badge + " " : "") + base;
+}
+
+// Resource-group/subscription group labels stay visible at any zoom level, like a folder
+// label - group boxes are naturally sparse, unlike the (much more numerous) leaf resources.
+function groupNodeLabel(el) {
+  var base = el.data("label");
+  var count = el.data("descendantCount");
+  return count ? base + " (" + count + ")" : base;
+}
+
+function labelOpacity(el) {
+  if (showLabelsGlobally) return 1;
+  if (el.hasClass("selected") || el.hasClass("highlighted") || el.hasClass("label-hover") || el.hasClass("playback-active")) return 1;
+  return 0;
+}
+
+function buildStylesheet() {
+  var stylesheet = [
+    {
+      selector: "node",
+      style: {
+        "background-image": function(el) { return getNodeImage(typeMeta(el.data("type"))); },
+        "background-fit": "cover",
+        "background-clip": "node",
+        "shape": "round-rectangle",
+        "border-width": 3,
+        "border-color": function(el) {
+          var state = el.data("state");
+          return state ? nodeStateColor(state) : healthBorder(el.data("health"));
+        },
+        "label": nodeLabel,
+        "text-opacity": labelOpacity,
+        "color": "#e6e6e6",
+        "font-size": 10,
+        "text-valign": "bottom",
+        "text-margin-y": 6,
+        "text-background-color": "#0e1117",
+        "text-background-opacity": 0.7,
+        "text-background-padding": 2,
+        "width": 34,
+        "height": 34
+      }
+    },
+    {
+      // Resource-group / subscription compound (parent) nodes: a translucent labeled box
+      // around their children instead of an icon tile - the nesting itself shows containment.
+      selector: "node:parent",
+      style: {
+        "background-image": "none",
+        "background-color": function(el) { return typeMeta(el.data("type")).color; },
+        "background-opacity": 0.12,
+        "border-width": 2,
+        "border-style": "dashed",
+        "border-color": function(el) { return typeMeta(el.data("type")).color; },
+        "shape": "round-rectangle",
+        "padding": 28,
+        "text-valign": "top",
+        "text-halign": "center",
+        "text-margin-y": -6,
+        "font-size": 13,
+        "font-weight": "bold",
+        "label": groupNodeLabel,
+        "text-opacity": 1
+      }
+    },
+    {
+      // Collapsed resource group (cytoscape-expand-collapse's stand-in node) - looks like any
+      // other type-colored icon tile, just bigger, with a descendant count in its label.
+      selector: "node.cy-expand-collapse-collapsed-node",
+      style: {
+        "background-image": function(el) { return getNodeImage(typeMeta(el.data("type"))); },
+        "background-fit": "cover",
+        "background-clip": "node",
+        "background-opacity": 1,
+        "shape": "round-rectangle",
+        "border-style": "solid",
+        "width": 46,
+        "height": 46,
+        "font-size": 11,
+        "font-weight": "bold",
+        "text-opacity": 1,
+        "label": groupNodeLabel
+      }
+    },
+    { selector: "node.synthetic-root", style: { "font-size": 14 } },
+    { selector: "node.selected", style: { "border-color": SELECTED_COLOR, "border-width": 5, "width": 44, "height": 44 } },
+    { selector: "node.highlighted", style: { "border-color": "#ffffff", "border-width": 5 } },
+    { selector: "node.state-investigating", style: { "border-width": 5, "border-style": "double" } },
+    {
+      selector: "node.state-root_cause",
+      style: { "border-width": 5, "underlay-color": "#e74c3c", "underlay-opacity": 0.5, "underlay-padding": 8 }
+    },
+    {
+      selector: "node.state-warning",
+      style: { "underlay-color": "#f1c40f", "underlay-opacity": 0.3, "underlay-padding": 5 }
+    },
+    {
+      selector: "node.state-offline",
+      style: { "underlay-color": "#7f1d1d", "underlay-opacity": 0.45, "underlay-padding": 6 }
+    },
+    { selector: "node.state-not_involved", style: { "opacity": 0.35 } },
+    {
+      selector: "edge",
+      style: {
+        "width": function(el) { return (EDGE_STYLE_META[el.data("style")] || {}).dashed ? 2.5 : 1.5; },
+        "line-color": function(el) { return (EDGE_STYLE_META[el.data("style")] || EDGE_STYLE_META.normal).color; },
+        "target-arrow-color": function(el) { return (EDGE_STYLE_META[el.data("style")] || EDGE_STYLE_META.normal).color; },
+        "target-arrow-shape": "triangle",
+        "curve-style": "bezier",
+        "opacity": 0.7,
+        "line-style": function(el) { return (EDGE_STYLE_META[el.data("style")] || {}).dashed ? "dashed" : "solid"; }
+      }
+    },
+    { selector: "edge.style-active_investigation", style: { "opacity": 1, "width": 3 } },
+    { selector: "edge.style-root_cause_path", style: { "opacity": 1, "width": 3 } },
+    { selector: "edge.highlighted", style: { "opacity": 1 } },
+    { selector: "node.dimmed", style: { "opacity": 0.12 } },
+    { selector: "edge.dimmed", style: { "opacity": 0.04 } },
+    { selector: "node.playback-active", style: { "border-color": "#ffffff", "border-width": 6, "width": 50, "height": 50 } }
+  ];
+  return stylesheet;
+}
+
+function applyNodeAndEdgeClasses() {
+  if (!cy) return;
+  cy.batch(function() {
+    cy.nodes().forEach(function(n) {
+      var state = n.data("state");
+      n.classes(n.classes().filter(function(c) { return c.indexOf("state-") !== 0; }));
+      if (state) n.addClass("state-" + state);
+    });
+    cy.edges().forEach(function(e) {
+      var style = e.data("style") || "normal";
+      e.classes(e.classes().filter(function(c) { return c.indexOf("style-") !== 0; }));
+      e.addClass("style-" + style);
+    });
+  });
+  ensureAnimationRunning();
+}
+
+function render(args) {
+  hideTooltip();
+
+  var nodes = args.nodes || [];
+  var edges = args.edges || [];
+  var selectedId = args.selected_id || null;
+  var nodeStates = args.node_states || {};
+  var edgeStylesArg = args.edge_styles || {};
+  graphHeight = args.height || 680;
+  viewMode = args.view_mode === "workspace" ? "workspace" : "explorer";
+
+  lastNodes = nodes;
+  lastEdges = edges;
+  lastNodeStates = nodeStates;
+  lastEdgeStyles = edgeStylesArg;
+  lastEvents = args.investigation_events || [];
+
+  document.getElementById("cy").style.height = graphHeight + "px";
+  toggleWorkspaceOnlyControls();
+
+  var argsKey = JSON.stringify({ v: viewMode, n: nodes.map(function(n){return n.id || n.resource_id;}), e: edges.length });
+  var statesKey = JSON.stringify(nodeStates) + JSON.stringify(edgeStylesArg);
+
+  if (!cy) {
+    cy = cytoscape({
+      container: document.getElementById("cy"),
+      elements: buildElements(nodes, edges, selectedId, nodeStates),
+      style: buildStylesheet(),
+      layout: { name: "preset" },
+      minZoom: 0.1,
+      maxZoom: 3,
+      wheelSensitivity: 0.25
+    });
+    initExpandCollapse();
+    autoCollapseIfLarge(nodes.length, computeKeepExpandedRgIds(selectedId, nodeStates));
+
+    cy.on("tap", "node", function(evt) {
+      var node = evt.target;
+      var nodeId = node.id();
+      hideTooltip();
+      toggleGroupNode(node);
+      if (node.data("synthetic")) { return; }
+      applyHighlight(nodeId);
+      setComponentValue(nodeId);
+    });
+    cy.on("tap", function(evt) {
+      if (evt.target === cy) hideTooltip();
+    });
+    cy.on("mouseover", "node", function(evt) { evt.target.addClass("label-hover"); showTooltip(evt); });
+    cy.on("mouseout", "node", function(evt) { evt.target.removeClass("label-hover"); hideTooltip(); });
+    cy.on("mousemove", "node", moveTooltip);
+    cy.on("zoom", updateLabelVisibility);
+    cy.on("pan zoom render", scheduleMinimapDraw);
+
+    applyNodeAndEdgeClasses();
+    lastArgsKey = argsKey;
+    lastStatesKey = statesKey;
+    lastSelectedId = selectedId || null;
+    if (viewMode === "explorer") applyInitialLayoutSelection(nodes.length);
+    runLayout(false);
+    applyHighlight(selectedId);
+    updateLabelVisibility();
+  } else if (argsKey !== lastArgsKey) {
+    cy.batch(function() {
+      cy.elements().remove();
+      cy.add(buildElements(nodes, edges, selectedId, nodeStates));
+    });
+    initExpandCollapse();
+    autoCollapseIfLarge(nodes.length, computeKeepExpandedRgIds(selectedId, nodeStates));
+    applyNodeAndEdgeClasses();
+    lastArgsKey = argsKey;
+    lastStatesKey = statesKey;
+    lastSelectedId = selectedId || null;
+    if (viewMode === "explorer") applyInitialLayoutSelection(nodes.length);
+    runLayout(false);
+    applyHighlight(selectedId);
+  } else {
+    if (statesKey !== lastStatesKey) {
+      cy.batch(function() {
+        cy.nodes().forEach(function(n) {
+          var id = n.id();
+          n.data("state", nodeStates[id] || "");
+        });
+        cy.edges().forEach(function(e) {
+          var k = edgeKey(e.data("source"), e.data("target"));
+          e.data("style", edgeStylesArg[k] || "normal");
+        });
+      });
+      applyNodeAndEdgeClasses();
+      lastStatesKey = statesKey;
+    }
+    lastSelectedId = selectedId || null;
+    applyHighlight(selectedId);
+    if (viewMode === "workspace") centerOnSelected();
+  }
+
+  refreshFilterOptions(nodes);
+  refreshLegend();
+  refreshPlaybackControls();
+  applyCombinedFilter();
+  drawMinimap();
+  updateFrameHeight();
+}
+
+function toggleWorkspaceOnlyControls() {
+  var isWorkspace = viewMode === "workspace";
+  ["layoutSelect", "toggleCollapse", "expandAll", "collapseAll"].forEach(function(id) {
+    document.getElementById(id).style.display = isWorkspace ? "none" : "";
+  });
+  var isLargeGraph = !isWorkspace && lastNodes.length > AUTO_COLLAPSE_NODE_THRESHOLD;
+  document.getElementById("lazyHint").style.display = isLargeGraph ? "block" : "none";
+  if (isLargeGraph) {
+    document.getElementById("lazyHint").textContent =
+      "Large graph: resource groups start collapsed. Click a resource group to expand/collapse it, or use Expand All.";
+  }
+}
+
+// Sets ONLY the selected/highlighted/dimmed classes for the 1-hop neighborhood of
+// `selectedId` - a leaf function that never calls back into applyHighlight/applyCombinedFilter,
+// so it's safe for both of those to call it without risking mutual recursion.
+function setHighlightClasses(selectedId) {
+  if (!cy) return;
+  cy.batch(function() {
+    cy.nodes().removeClass("selected highlighted dimmed");
+    cy.edges().removeClass("highlighted dimmed");
+
+    if (!selectedId) return;
+    var selectedNode = cy.getElementById(selectedId);
+    if (selectedNode.empty()) return;
+
+    selectedNode.addClass("selected");
+
+    var neighborhood = selectedNode.neighborhood();
+    var connectedNodes = neighborhood.nodes();
+    var connectedEdges = neighborhood.edges();
+
+    connectedNodes.addClass("highlighted");
+    connectedEdges.addClass("highlighted");
+
+    cy.nodes().not(selectedNode).not(connectedNodes).addClass("dimmed");
+    cy.edges().not(connectedEdges).addClass("dimmed");
+  });
+}
+
+// Clicking a node highlights only that node and its directly connected
+// resources (1-hop neighborhood); everything else dims. Dragging/zoom/pan
+// stay fully interactive - this only toggles CSS classes.
+function applyHighlight(selectedId) {
+  if (!cy) return;
+  lastSelectedId = selectedId || null;
+  setHighlightClasses(selectedId);
+
+  var selectedNode = selectedId ? cy.getElementById(selectedId) : null;
+  if (selectedNode && !selectedNode.empty()) {
+    if (collapsedToDependencies) applyCollapseState();
+    if (viewMode === "workspace") centerOnSelected();
+  }
+  applyCombinedFilter();
+}
+
+// --- Search + multi-filter --------------------------------------------------------------------
+function refreshFilterOptions(nodes) {
+  fillSelectOptions("filterType", uniqueSorted(nodes.map(function(n) { return n.type; })), function(v) {
+    var meta = typeMeta(v);
+    return meta.icon + " " + meta.name;
+  });
+  fillSelectOptions("filterRG", uniqueSorted(nodes.map(function(n) { return n.resource_group; })));
+  fillSelectOptions("filterSub", uniqueSorted(nodes.map(function(n) { return n.subscription || n.subscription_id; })));
+}
+
+function uniqueSorted(arr) {
+  var seen = {};
+  var out = [];
+  arr.forEach(function(v) {
+    if (v && !seen[v]) { seen[v] = true; out.push(v); }
+  });
+  out.sort();
+  return out;
+}
+
+function fillSelectOptions(selectId, values, labelFn) {
+  var el = document.getElementById(selectId);
+  var current = el.value;
+  var firstOption = el.options[0];
+  el.innerHTML = "";
+  el.appendChild(firstOption);
+  values.forEach(function(v) {
+    var opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = labelFn ? labelFn(v) : v;
+    el.appendChild(opt);
+  });
+  if (values.indexOf(current) !== -1) el.value = current;
+}
+
+function applyCombinedFilter() {
+  if (!cy) return;
+  var query = document.getElementById("search").value.trim().toLowerCase();
+  var typeFilter = activeTypeFilter || document.getElementById("filterType").value;
+  var healthFilter = document.getElementById("filterHealth").value;
+  var rgFilter = document.getElementById("filterRG").value;
+  var subFilter = document.getElementById("filterSub").value;
+
+  var anyFilter = query || typeFilter || healthFilter || rgFilter || subFilter;
+  if (!anyFilter) {
+    // No search/filter active: just re-assert whatever setHighlightClasses() already set
+    // (selection-based highlight, or nothing). Must NOT call applyHighlight() here - that
+    // would call back into this function and recurse forever.
+    setHighlightClasses(lastSelectedId);
+    return;
+  }
+
+  // Match against lastNodes/lastNodeStates (the complete backend data), not cy.nodes() -
+  // cytoscape-expand-collapse detaches a collapsed resource group's children from the live
+  // graph model entirely, so a match living inside one wouldn't be found by querying cy directly.
+  var matchedIds = lastNodes.filter(function(n) {
+    var id = n.id || n.resource_id;
+    if (!id) return false;
+    var typeVal = n.type || "unknown";
+    if (query) {
+      var typeName = typeMeta(typeVal).name;
+      var hay = [n.name || id, typeVal, typeName, n.resource_group, n.subscription || n.subscription_id]
+        .join(" ").toLowerCase();
+      if (hay.indexOf(query) === -1) return false;
+    }
+    if (typeFilter && typeVal !== typeFilter) return false;
+    if (healthFilter) {
+      var effective = (lastNodeStates || {})[id] || (n.health_status || "").toLowerCase();
+      if (effective !== healthFilter) return false;
+    }
+    if (rgFilter && (n.resource_group || "") !== rgFilter) return false;
+    if (subFilter && (n.subscription || n.subscription_id || "") !== subFilter) return false;
+    return true;
+  }).map(function(n) { return n.id || n.resource_id; });
+
+  // Expand any collapsed resource group standing between a match and the visible graph.
+  var expandedAny = false;
+  var rgIdsToExpand = {};
+  matchedIds.forEach(function(id) {
+    if (!cy.getElementById(id).empty()) return;
+    var rg = resourceGroupIdFor(id);
+    if (rg) rgIdsToExpand[rg] = true;
+  });
+  Object.keys(rgIdsToExpand).forEach(function(rgId) {
+    var rgNode = cy.getElementById(rgId);
+    if (!rgNode.empty() && expandCollapseApi && expandCollapseApi.isExpandable(rgNode)) {
+      expandCollapseApi.expand(rgNode);
+      expandedAny = true;
+    }
+  });
+  if (expandedAny) runLayout(true);
+
+  var matched = cy.collection();
+  matchedIds.forEach(function(id) {
+    var n = cy.getElementById(id);
+    if (!n.empty()) matched = matched.union(n);
+  });
+
+  cy.batch(function() {
+    cy.nodes().addClass("dimmed").removeClass("highlighted");
+    cy.edges().addClass("dimmed").removeClass("highlighted");
+    matched.removeClass("dimmed").addClass("highlighted");
+  });
+}
+
+// Debounced: applyCombinedFilter does a full node/edge scan plus a cy.batch() class toggle, and
+// can additionally trigger a full ELK relayout (runLayout) if the typed prefix auto-expands a
+// previously-collapsed group - running that on every single keystroke made typing itself feel
+// unresponsive on a large topology. Waiting for a short pause keeps the input always instant
+// (native browser behavior, unrelated to this handler) while still filtering promptly once the
+// user stops typing.
+(function () {
+  var searchDebounceTimer = null;
+  document.getElementById("search").addEventListener("input", function () {
+    if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(applyCombinedFilter, 220);
+  });
+})();
+["filterType", "filterHealth", "filterRG", "filterSub"].forEach(function(id) {
+  document.getElementById(id).addEventListener("change", function() {
+    if (id === "filterType") activeTypeFilter = "";
+    applyCombinedFilter();
+    refreshLegend();
+  });
+});
+
+// --- Toolbar: zoom / fit / affected / investigation / collapse / layout ------------------------
+document.getElementById("zoomIn").addEventListener("click", function() { if (cy) cy.zoom(cy.zoom() * 1.2); });
+document.getElementById("zoomOut").addEventListener("click", function() { if (cy) cy.zoom(cy.zoom() * 0.8); });
+document.getElementById("fit").addEventListener("click", function() { if (cy) cy.fit(cy.elements(":visible"), 30); });
+
+document.getElementById("zoomAffected").addEventListener("click", function() {
+  if (!cy) return;
+  var affected = cy.nodes(":visible").filter(function(n) {
+    var s = n.data("state");
+    return s === "investigating" || s === "root_cause" || s === "dependency" || s === "warning" || s === "offline";
+  });
+  if (affected.length) cy.fit(affected, 60); else cy.fit(cy.elements(":visible"), 30);
+});
+
+document.getElementById("fitInvestigation").addEventListener("click", function() {
+  if (!cy) return;
+  var involved = cy.nodes(":visible").filter(function(n) {
+    var s = n.data("state");
+    return s && s !== "not_involved" && s !== "healthy";
+  });
+  if (!involved.length && lastSelectedId) involved = cy.getElementById(lastSelectedId).union(cy.getElementById(lastSelectedId).neighborhood().nodes());
+  if (involved.length) cy.fit(involved, 60); else cy.fit(cy.elements(":visible"), 30);
+});
+
+document.getElementById("toggleCollapse").addEventListener("click", function() {
+  collapsedToDependencies = !collapsedToDependencies;
+  document.getElementById("toggleCollapse").classList.toggle("active", collapsedToDependencies);
+  document.getElementById("toggleCollapse").textContent = collapsedToDependencies ? "Expand Deps" : "Collapse Deps";
+  applyCollapseState();
+});
+
+function applyCollapseState() {
+  if (!cy) return;
+  if (!collapsedToDependencies || !lastSelectedId) {
+    cy.elements().show();
+    if (expandCollapseApi) expandCollapseApi.expandAll();
+    runLayout(true);
+    return;
+  }
+  var selectedNode = cy.getElementById(lastSelectedId);
+  if (selectedNode.empty()) return;
+  var keep = selectedNode.union(selectedNode.neighborhood());
+  cy.batch(function() {
+    cy.elements().not(keep).hide();
+    keep.show();
+  });
+}
+
+document.getElementById("layoutSelect").addEventListener("change", function() {
+  if (viewMode === "explorer") setStoredLayoutPreference(this.value);
+  runLayout(true);
+});
+
+// --- Full screen ---------------------------------------------------------------------------------
+document.getElementById("toggleFullscreen").addEventListener("click", function() {
+  var wrap = document.getElementById("cyWrap");
+  if (!document.fullscreenElement) {
+    if (wrap.requestFullscreen) wrap.requestFullscreen();
+  } else {
+    if (document.exitFullscreen) document.exitFullscreen();
+  }
+});
+document.addEventListener("fullscreenchange", function() {
+  var wrap = document.getElementById("cyWrap");
+  var cyEl = document.getElementById("cy");
+  if (document.fullscreenElement === wrap) {
+    cyEl.style.height = window.innerHeight + "px";
+  } else {
+    cyEl.style.height = graphHeight + "px";
+  }
+  if (cy) cy.resize();
+});
+
+// --- Mini map (throttled to at most one redraw per animation frame) -----------------------------
+document.getElementById("toggleMinimap").addEventListener("click", function() {
+  minimapVisible = !minimapVisible;
+  document.getElementById("toggleMinimap").classList.toggle("active", minimapVisible);
+  document.getElementById("minimap").style.display = minimapVisible ? "block" : "none";
+  drawMinimap();
+});
+
+var _minimapRAF = null;
+function scheduleMinimapDraw() {
+  if (_minimapRAF) return;
+  _minimapRAF = requestAnimationFrame(function() {
+    _minimapRAF = null;
+    drawMinimap();
+  });
+}
+
+function drawMinimap() {
+  var canvas = document.getElementById("minimap");
+  if (!cy || !minimapVisible || canvas.style.display === "none") return;
+  var ctx = canvas.getContext("2d");
+  var w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  var nodes = cy.nodes(":visible");
+  if (!nodes.length) return;
+  var bb = cy.elements(":visible").boundingBox();
+  if (!isFinite(bb.w) || !isFinite(bb.h) || bb.w === 0 || bb.h === 0) return;
+
+  var pad = 6;
+  var scale = Math.min((w - pad * 2) / bb.w, (h - pad * 2) / bb.h);
+
+  function toMini(pos) {
+    return {
+      x: pad + (pos.x - bb.x1) * scale,
+      y: pad + (pos.y - bb.y1) * scale
+    };
+  }
+
+  nodes.forEach(function(n) {
+    var p = toMini(n.position());
+    ctx.fillStyle = typeMeta(n.data("type")).color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  var extent = cy.extent();
+  var topLeft = toMini({ x: extent.x1, y: extent.y1 });
+  var bottomRight = toMini({ x: extent.x2, y: extent.y2 });
+  ctx.strokeStyle = "#e6e6e6";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(topLeft.x, topLeft.y, bottomRight.x - topLeft.x, bottomRight.y - topLeft.y);
+
+  canvas._bb = bb;
+  canvas._scale = scale;
+  canvas._pad = pad;
+}
+
+document.getElementById("minimap").addEventListener("click", function(e) {
+  if (!cy) return;
+  var canvas = e.target;
+  if (!canvas._bb) return;
+  var rect = canvas.getBoundingClientRect();
+  var mx = e.clientX - rect.left;
+  var my = e.clientY - rect.top;
+  var modelX = canvas._bb.x1 + (mx - canvas._pad) / canvas._scale;
+  var modelY = canvas._bb.y1 + (my - canvas._pad) / canvas._scale;
+  cy.center();
+  var zoom = cy.zoom();
+  cy.pan({
+    x: cy.width() / 2 - modelX * zoom,
+    y: cy.height() / 2 - modelY * zoom
+  });
+});
+
+// --- Zoom-driven label visibility ----------------------------------------------------------------
+function updateLabelVisibility() {
+  if (!cy) return;
+  var shouldShow = cy.zoom() >= LABEL_ZOOM_THRESHOLD;
+  if (shouldShow !== showLabelsGlobally) {
+    showLabelsGlobally = shouldShow;
+    cy.style().update(); // function-valued styles (text-opacity) need an explicit refresh
+  }
+}
+
+// --- Tooltips (hover-only; explicitly hidden on tap/render so it never sticks near a node) -------
+function showTooltip(evt) {
+  var d = evt.target.data();
+  var meta = typeMeta(d.type);
+  var tip = document.getElementById("tooltip");
+  var stateInfo = d.state ? NODE_STATE_META[d.state] : null;
+  var statusColor = stateInfo ? stateInfo.color : healthBorder(d.health);
+  var lines = [
+    "Resource Group: " + (d.resource_group || "Unknown"),
+    "Subscription: " + (d.subscription || "Unknown"),
+    "Region: " + (d.region || "Unknown"),
+    "<span class=\"status-dot\" style=\"background:" + statusColor + "\"></span>Health: " + (d.health || "Unknown") +
+      (stateInfo ? " &middot; " + stateInfo.label : ""),
+    "Last Deployment: " + (d.last_deployment || "Unknown"),
+    "Monthly Cost: " + (d.monthly_cost !== "" ? ("$" + d.monthly_cost) : "N/A"),
+    "AI Health Score: " + (d.health_score !== "" ? (d.health_score + "/100") : "N/A")
+  ];
+  tip.innerHTML =
+    '<div class="tip-head"><span class="tip-swatch" style="background:' + meta.color + '"></span>' +
+    "<b>" + (d.label || d.id) + "</b></div>" +
+    '<div class="row">' + meta.icon + " " + meta.name + "</div>" +
+    lines.map(function(l) { return '<div class="row">' + l + "</div>"; }).join("");
+  tip.style.display = "block";
+  moveTooltip(evt);
+}
+function moveTooltip(evt) {
+  var tip = document.getElementById("tooltip");
+  var oe = evt.originalEvent;
+  if (!oe) return;
+  var left = oe.clientX + 14;
+  var top = oe.clientY + 14;
+  var maxLeft = window.innerWidth - tip.offsetWidth - 10;
+  var maxTop = window.innerHeight - tip.offsetHeight - 10;
+  tip.style.left = Math.max(4, Math.min(left, maxLeft > 0 ? maxLeft : left)) + "px";
+  tip.style.top = Math.max(4, Math.min(top, maxTop > 0 ? maxTop : top)) + "px";
+}
+function hideTooltip() {
+  document.getElementById("tooltip").style.display = "none";
+}
+
+// --- Legend (dynamic: only types actually present on the current graph) -------------------------
+function refreshLegend() {
+  var stateHost = document.getElementById("nodeStateLegend");
+  stateHost.innerHTML = "";
+  NODE_STATES.forEach(function(s) {
+    var count = cy ? cy.nodes().filter(function(n) { return n.data("state") === s.key; }).length : 0;
+    var item = document.createElement("div");
+    item.className = "legend-item";
+    item.innerHTML =
+      '<span class="legend-dot" style="border-color:' + s.color + '"></span>' +
+      '<span class="legend-text"><b>' + s.label + " (" + count + ")</b><span>" + s.description + "</span></span>";
+    stateHost.appendChild(item);
+  });
+
+  var edgeHost = document.getElementById("edgeStyleLegend");
+  edgeHost.innerHTML = "";
+  EDGE_STYLES.forEach(function(s) {
+    var item = document.createElement("div");
+    item.className = "legend-item";
+    item.innerHTML =
+      '<span class="legend-edge-line" style="border-top-color:' + s.color + ';border-top-style:' + (s.dashed ? "dashed" : "solid") + '"></span>' +
+      '<span class="legend-text"><b>' + s.label + '</b><span>' + s.description + "</span></span>";
+    edgeHost.appendChild(item);
+  });
+
+  var typeHost = document.getElementById("resourceTypeLegend");
+  typeHost.innerHTML = "";
+  var presentTypes = {};
+  lastNodes.forEach(function(n) {
+    var meta = typeMeta(n.type);
+    if (!presentTypes[meta.key]) presentTypes[meta.key] = { meta: meta, count: 0 };
+    presentTypes[meta.key].count++;
+  });
+  Object.keys(presentTypes).sort(function(a, b) {
+    return presentTypes[b].count - presentTypes[a].count;
+  }).forEach(function(key) {
+    var entry = presentTypes[key];
+    var t = entry.meta;
+    var item = document.createElement("div");
+    item.className = "legend-item clickable" + (activeTypeFilter === t.key ? " active-filter" : "");
+    item.innerHTML =
+      '<span class="legend-swatch" style="background:' + t.color + '"></span>' +
+      '<span class="legend-text"><b>' + t.icon + " " + t.name + " (" + entry.count + ")</b><span>" + t.description + "</span></span>";
+    item.addEventListener("click", function() { onLegendTypeClick(t); });
+    typeHost.appendChild(item);
+  });
+}
+
+function onLegendTypeClick(t) {
+  var rawTypeValue = null;
+  lastNodes.forEach(function(n) { if (!rawTypeValue && typeMeta(n.type).key === t.key) rawTypeValue = n.type; });
+  var filterValue = rawTypeValue || t.key;
+  activeTypeFilter = (activeTypeFilter === filterValue) ? "" : filterValue;
+  document.getElementById("filterType").value = activeTypeFilter;
+  applyCombinedFilter();
+  refreshLegend();
+
+  var detail = document.getElementById("typeDetail");
+  if (!activeTypeFilter) { detail.style.display = "none"; return; }
+  var count = cy ? cy.nodes().filter(function(n) { return typeMeta(n.data("type")).key === t.key; }).length : 0;
+  detail.style.display = "block";
+  detail.innerHTML =
+    "<b>" + t.icon + " " + t.name + "</b> &middot; " + count + " on this graph<br/>" +
+    "<span>" + t.description + "</span><br/>" +
+    (t.purpose ? "<b>Purpose:</b> " + t.purpose + "<br/>" : "") +
+    (t.relationships ? "<b>Typical relationships:</b> " + t.relationships : "");
+  updateFrameHeight();
+}
+
+// --- Animations: investigating pulse + active-investigation marching ants -----------------------
+// Only runs while there's something to animate (an active investigation path or an investigating
+// node); otherwise the interval is stopped so idle graphs cost nothing in the background.
+var animTimer = null;
+var dashOffset = 0;
+function hasAnimatableElements() {
+  if (!cy) return false;
+  return cy.edges(".style-active_investigation").length > 0 || cy.nodes(".state-investigating").length > 0;
+}
+function ensureAnimationRunning() {
+  if (!cy) return;
+  if (hasAnimatableElements()) {
+    if (!animTimer) animTimer = setInterval(animationTick, 90);
+  } else if (animTimer) {
+    clearInterval(animTimer);
+    animTimer = null;
+  }
+}
+function animationTick() {
+  if (!cy) return;
+  if (!hasAnimatableElements()) { ensureAnimationRunning(); return; }
+  dashOffset = (dashOffset - 2) % 32;
+
+  var activeEdges = cy.edges(".style-active_investigation");
+  activeEdges.style({ "line-dash-pattern": [8, 4], "line-dash-offset": dashOffset });
+
+  var phase = (Math.sin(Date.now() / 220) + 1) / 2; // 0..1
+  var investigatingNodes = cy.nodes(".state-investigating");
+  investigatingNodes.style({
+    "overlay-color": "#3498db",
+    "overlay-opacity": 0.15 + phase * 0.25,
+    "overlay-padding": 6 + phase * 4
+  });
+}
+
+// --- Investigation playback ------------------------------------------------------------------------
+var playbackIndex = -1;
+var playbackTimer = null;
+
+function refreshPlaybackControls() {
+  var scrub = document.getElementById("playbackScrub");
+  scrub.max = Math.max(0, lastEvents.length - 1);
+  if (playbackIndex >= lastEvents.length) playbackIndex = lastEvents.length - 1;
+  if (!lastEvents.length) {
+    document.getElementById("playbackLabel").textContent = "No investigation events recorded yet.";
+    scrub.value = 0;
+  } else {
+    updatePlaybackLabel();
+  }
+}
+
+function updatePlaybackLabel() {
+  var scrub = document.getElementById("playbackScrub");
+  var idx = playbackIndex >= 0 ? playbackIndex : 0;
+  scrub.value = idx;
+  var ev = lastEvents[idx];
+  if (!ev) return;
+  document.getElementById("playbackLabel").textContent =
+    "[" + (idx + 1) + "/" + lastEvents.length + "] " + ev.timestamp + " - " + ev.label;
+  applyPlaybackHighlight(idx);
+}
+
+function applyPlaybackHighlight(uptoIdx) {
+  if (!cy) return;
+  cy.nodes().removeClass("playback-active");
+  var ev = lastEvents[uptoIdx];
+  if (ev && ev.node_id) {
+    var n = cy.getElementById(ev.node_id);
+    if (!n.empty()) n.addClass("playback-active");
+  }
+}
+
+document.getElementById("playbackScrub").addEventListener("input", function(e) {
+  playbackIndex = parseInt(e.target.value, 10);
+  updatePlaybackLabel();
+});
+document.getElementById("playbackPrev").addEventListener("click", function() {
+  if (!lastEvents.length) return;
+  playbackIndex = Math.max(0, (playbackIndex < 0 ? 0 : playbackIndex) - 1);
+  updatePlaybackLabel();
+});
+document.getElementById("playbackNext").addEventListener("click", function() {
+  if (!lastEvents.length) return;
+  playbackIndex = Math.min(lastEvents.length - 1, (playbackIndex < 0 ? -1 : playbackIndex) + 1);
+  updatePlaybackLabel();
+});
+document.getElementById("playbackPlay").addEventListener("click", function() {
+  var btn = document.getElementById("playbackPlay");
+  if (playbackTimer) {
+    clearInterval(playbackTimer);
+    playbackTimer = null;
+    btn.textContent = "▶ Play";
+    return;
+  }
+  if (!lastEvents.length) return;
+  if (playbackIndex >= lastEvents.length - 1) playbackIndex = -1;
+  btn.textContent = "⏸ Pause";
+  playbackTimer = setInterval(function() {
+    playbackIndex += 1;
+    if (playbackIndex >= lastEvents.length) {
+      clearInterval(playbackTimer);
+      playbackTimer = null;
+      btn.textContent = "▶ Play";
+      return;
+    }
+    updatePlaybackLabel();
+  }, 1100);
+});
+
+document.getElementById("legendPanel").addEventListener("toggle", updateFrameHeight);
+document.getElementById("playbackPanel").addEventListener("toggle", updateFrameHeight);
+window.addEventListener("resize", updateFrameHeight);
+
+onRender(render);
+initStreamlit();
+setFrameHeight(680);
+</script>
+</body>
+</html>

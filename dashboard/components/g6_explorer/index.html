@@ -1,0 +1,1697 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<script src="./g6.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #0e1117; font-family: "Source Sans Pro", sans-serif; color: #e6e6e6; }
+  #root { display: flex; flex-direction: column; }
+  #toolbar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; align-items: center; background: #11151c; border-bottom: 1px solid #262a34; }
+  .g6-search {
+    flex: 1 1 200px; min-width: 160px; padding: 6px 10px; border-radius: 6px; border: 1px solid #363b47;
+    background: #1c212c; color: #e6e6e6; font-size: 13px; outline: none;
+  }
+  select.g6-tool, button.g6-tool {
+    background: #262a34; color: #e6e6e6; border: 1px solid #363b47; border-radius: 6px;
+    padding: 6px 8px; font-size: 12px; cursor: pointer;
+  }
+  button.g6-tool:hover { background: #363b47; }
+  button.g6-tool.active { background: #2E86AB; border-color: #2E86AB; }
+  #g6Wrap { position: relative; background: #0e1117; flex: 1 1 auto; min-height: 0; }
+  #g6Container { width: 100%; }
+  #hint { color: #808495; font-size: 11px; padding: 3px 10px; }
+  #perfBadge { font-size: 10.5px; color: #6f7893; padding: 2px 10px; }
+  /* The whole #root (toolbar included) goes fullscreen - not just the canvas - so search,
+     filters, viz selector, Page Fit, zoom and Reset Layout stay reachable while fullscreen. */
+  #root:fullscreen { background: #0e1117; display: flex; flex-direction: column; width: 100vw; height: 100vh; }
+  #root:fullscreen #g6Wrap { flex: 1 1 auto; min-height: 0; }
+  /* #g6Container's height is normally an inline px value computed from the Streamlit iframe's
+     embedded height (see render()/setFrameHeight) - that value has nothing to do with the real
+     screen size, so once fullscreen it must stretch to fill #g6Wrap instead (the !important wins
+     over the inline style; this rule stops applying - and the inline height takes back over -
+     the instant :fullscreen no longer matches, i.e. immediately on exit). */
+  #root:fullscreen #g6Container { width: 100% !important; height: 100% !important; }
+  .tooltip {
+    background: #1c212c !important; border: 1px solid #363b47 !important; border-radius: 6px !important;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.45) !important; color: #e6e6e6 !important;
+  }
+</style>
+</head>
+<body>
+<div id="root">
+  <div id="toolbar">
+    <input id="search" class="g6-search" type="text" placeholder="Search resources by name, type, or resource group..." />
+    <select id="filterType" class="g6-tool"><option value="">All Types</option></select>
+    <select id="filterHealth" class="g6-tool">
+      <option value="">All Health</option>
+      <option value="healthy">Healthy</option>
+      <option value="warning">Warning</option>
+      <option value="critical">Critical</option>
+    </select>
+    <select id="vizType" class="g6-tool" title="Visualization layout">
+      <option value="hierarchical">Hierarchical</option>
+      <option value="tree">Tree</option>
+      <option value="network">Network</option>
+      <option value="radial">Radial</option>
+    </select>
+    <button id="expandAll" class="g6-tool">Expand All</button>
+    <button id="collapseAll" class="g6-tool">Collapse All</button>
+    <button id="zoomIn" class="g6-tool" title="Zoom in">Zoom In</button>
+    <button id="zoomOut" class="g6-tool" title="Zoom out">Zoom Out</button>
+    <button id="fitView" class="g6-tool">Fit View</button>
+    <button id="pageFitBtn" class="g6-tool" title="Recompute size and fit the whole graph into view (use after entering/exiting Full Screen)">Page Fit</button>
+    <button id="resetLayoutBtn" class="g6-tool" title="Discard manually-moved node positions and restore the automatic layout">Reset Layout</button>
+    <button id="fullscreenBtn" class="g6-tool">Full Screen</button>
+    <button id="refreshBtn" class="g6-tool" title="Re-fetch Azure resources">&#8635; Refresh</button>
+  </div>
+  <div id="g6Wrap">
+    <div id="g6Container"></div>
+  </div>
+  <div id="hint">Click a Resource Group / Type to expand or collapse it &middot; hover a resource to see its name, click to see its details and open its AI side panel &middot; drag a node to reposition it (use Reset Layout to undo) &middot; scroll to zoom &middot; drag background to pan</div>
+  <div id="perfBadge"></div>
+</div>
+<script>
+"use strict";
+
+// --- Minimal vanilla-JS implementation of the Streamlit Components protocol -----------------
+function sendMessageToStreamlit(type, data) {
+  var outData = Object.assign({ isStreamlitMessage: true, type: type }, data);
+  window.parent.postMessage(outData, "*");
+}
+function initStreamlit() { sendMessageToStreamlit("streamlit:componentReady", { apiVersion: 1 }); }
+function setFrameHeight(height) { sendMessageToStreamlit("streamlit:setFrameHeight", { height: height }); }
+function setComponentValue(value) { sendMessageToStreamlit("streamlit:setComponentValue", { value: value }); }
+
+var renderHandlers = [];
+function onRender(fn) { renderHandlers.push(fn); }
+window.addEventListener("message", function (event) {
+  if (event.data.type === "streamlit:render") {
+    renderHandlers.forEach(function (fn) { fn(event.data.args || {}); });
+  }
+});
+
+// --- Resource type catalogue (curated) + ARM type normalization --------------------------------
+// Same catalogue/approach as dashboard/components/reactflow_explorer and cytoscape_topology
+// (kept in sync by hand - these are independently-vendored Streamlit components, so there's no
+// shared module to import from without a build step).
+var RESOURCE_TYPES = [
+  { key: "subscription", name: "Subscription", color: "#2E86AB", icon: "🏢" },
+  { key: "resource_group", name: "Resource Group", color: "#A23B72", icon: "📁" },
+  { key: "app_service_plan", name: "App Service Plan", color: "#D4A017", icon: "📐" },
+  { key: "app_service", name: "App Service", color: "#C73E1D", icon: "🌐" },
+  { key: "static_web_app", name: "Static Web App", color: "#8E44AD", icon: "🕸" },
+  { key: "aks_cluster", name: "AKS Cluster", color: "#F18F01", icon: "☸" },
+  { key: "container_registry", name: "ACR (Container Registry)", color: "#2C3E50", icon: "🏗" },
+  { key: "container_instance", name: "Container Instance", color: "#16A085", icon: "📦" },
+  { key: "container_app", name: "Container App", color: "#1ABC9C", icon: "📦" },
+  { key: "sql_database", name: "Azure SQL", color: "#06A77D", icon: "🗄" },
+  { key: "cosmos_db", name: "Cosmos DB", color: "#2E9BD6", icon: "🌐" },
+  { key: "storage_account", name: "Storage Account", color: "#6C757D", icon: "💾" },
+  { key: "disk", name: "Managed Disk", color: "#7F8C8D", icon: "💽" },
+  { key: "key_vault", name: "Key Vault", color: "#991B1B", icon: "🔐" },
+  { key: "redis", name: "Redis", color: "#59C3C3", icon: "⚡" },
+  { key: "postgresql", name: "PostgreSQL", color: "#336791", icon: "🐘" },
+  { key: "mysql", name: "MySQL", color: "#4479A1", icon: "🐬" },
+  { key: "application_insights", name: "Application Insights", color: "#7B2D8E", icon: "📊" },
+  { key: "log_analytics", name: "Log Analytics", color: "#1F77B4", icon: "📋" },
+  { key: "azure_monitor", name: "Azure Monitor", color: "#3498DB", icon: "📈" },
+  { key: "vnet", name: "VNet", color: "#27AE60", icon: "🕸" },
+  { key: "nsg", name: "NSG", color: "#C0392B", icon: "🛡" },
+  { key: "load_balancer", name: "Load Balancer", color: "#E67E22", icon: "⚖" },
+  { key: "application_gateway", name: "Application Gateway", color: "#D35400", icon: "🚪" },
+  { key: "firewall", name: "Firewall", color: "#B03A2E", icon: "🧱" },
+  { key: "bastion", name: "Bastion", color: "#5B2C6F", icon: "🔒" },
+  { key: "vpn_gateway", name: "VPN/ExpressRoute Gateway", color: "#8E44AD", icon: "🔗" },
+  { key: "public_ip", name: "Public IP", color: "#2980B9", icon: "📡" },
+  { key: "network_interface", name: "Network Interface", color: "#5499C7", icon: "🔌" },
+  { key: "private_endpoint", name: "Private Endpoint", color: "#48C9B0", icon: "🔒" },
+  { key: "dns_zone", name: "DNS Zone", color: "#229954", icon: "🌐" },
+  { key: "cdn_front_door", name: "CDN / Front Door", color: "#F39C12", icon: "🚀" },
+  { key: "traffic_manager", name: "Traffic Manager", color: "#D68910", icon: "🚦" },
+  { key: "virtual_machine", name: "Virtual Machine", color: "#0F6FC5", icon: "🖥" },
+  { key: "availability_set", name: "Availability Set", color: "#2471A3", icon: "🖥" },
+  { key: "vm_scale_set", name: "VM Scale Set", color: "#1A5276", icon: "🖥" },
+  { key: "managed_identity", name: "Managed Identity", color: "#AF7AC5", icon: "🪪" },
+  { key: "automation_account", name: "Automation Account", color: "#884EA0", icon: "🤖" },
+  { key: "recovery_vault", name: "Recovery Services Vault", color: "#7D3C98", icon: "🛟" },
+  { key: "api_management", name: "API Management", color: "#0E6655", icon: "🔀" },
+  { key: "event_hub", name: "Event Hub", color: "#B9770E", icon: "📨" },
+  { key: "service_bus", name: "Service Bus", color: "#9C640C", icon: "📨" },
+  { key: "logic_app", name: "Logic App", color: "#2874A6", icon: "🔁" },
+  { key: "function_app", name: "Function App", color: "#E67E22", icon: "λ" },
+  { key: "data_factory", name: "Data Factory", color: "#138D75", icon: "🏭" },
+  { key: "cognitive_services", name: "Cognitive Services", color: "#AF601A", icon: "🧠" },
+  { key: "search_service", name: "Cognitive Search", color: "#186A3B", icon: "🔎" },
+  { key: "gitlab_project", name: "GitLab Project", color: "#FC6D26", icon: "🦊" },
+  { key: "pipeline", name: "Pipeline", color: "#E24329", icon: "⚙" },
+  { key: "unknown", name: "Unknown", color: "#95A5A6", icon: "◆" }
+];
+var RESOURCE_TYPE_BY_KEY = {};
+RESOURCE_TYPES.forEach(function (t) { RESOURCE_TYPE_BY_KEY[t.key] = t; });
+
+// Ordered most-specific-first: matchArmType returns the first hit, so a narrow rule (e.g. a
+// specific Microsoft.Web/staticSites) must precede any broader catch-all that would otherwise
+// swallow it (e.g. a bare "microsoft.web/" or "microsoft.compute/").
+var ARM_TYPE_RULES = [
+  { match: "microsoft.resources/resourcegroups", key: "resource_group" },
+  { match: "microsoft.web/serverfarms", key: "app_service_plan" },
+  { match: "microsoft.web/staticsites", key: "static_web_app" },
+  { match: "microsoft.web/sites/functions", key: "function_app" },
+  { match: "microsoft.web/sites", key: "app_service" },
+  { match: "microsoft.containerservice/managedclusters", key: "aks_cluster" },
+  { match: "microsoft.containerregistry/registries", key: "container_registry" },
+  { match: "microsoft.containerinstance/", key: "container_instance" },
+  { match: "microsoft.app/", key: "container_app" },
+  { match: "microsoft.documentdb/", key: "cosmos_db" },
+  { match: "microsoft.sql/", key: "sql_database" },
+  { match: "microsoft.dbforpostgresql/", key: "postgresql" },
+  { match: "microsoft.dbformysql/", key: "mysql" },
+  { match: "microsoft.cache/redis", key: "redis" },
+  { match: "microsoft.storage/storageaccounts", key: "storage_account" },
+  { match: "microsoft.compute/disks", key: "disk" },
+  { match: "microsoft.keyvault/vaults", key: "key_vault" },
+  { match: "microsoft.insights/components", key: "application_insights" },
+  { match: "microsoft.operationalinsights/workspaces", key: "log_analytics" },
+  { match: "microsoft.insights/", key: "azure_monitor" },
+  { match: "microsoft.network/virtualnetworks", key: "vnet" },
+  { match: "microsoft.network/networksecuritygroups", key: "nsg" },
+  { match: "microsoft.network/loadbalancers", key: "load_balancer" },
+  { match: "microsoft.network/applicationgateways", key: "application_gateway" },
+  { match: "microsoft.network/azurefirewalls", key: "firewall" },
+  { match: "microsoft.network/bastionhosts", key: "bastion" },
+  { match: "microsoft.network/vpngateways", key: "vpn_gateway" },
+  { match: "microsoft.network/virtualnetworkgateways", key: "vpn_gateway" },
+  { match: "microsoft.network/expressroutecircuits", key: "vpn_gateway" },
+  { match: "microsoft.network/publicipaddresses", key: "public_ip" },
+  { match: "microsoft.network/networkinterfaces", key: "network_interface" },
+  { match: "microsoft.network/privateendpoints", key: "private_endpoint" },
+  { match: "microsoft.network/privatednszones", key: "dns_zone" },
+  { match: "microsoft.network/dnszones", key: "dns_zone" },
+  { match: "microsoft.network/trafficmanagerprofiles", key: "traffic_manager" },
+  { match: "microsoft.cdn/", key: "cdn_front_door" },
+  { match: "microsoft.compute/availabilitysets", key: "availability_set" },
+  { match: "microsoft.compute/virtualmachinescalesets", key: "vm_scale_set" },
+  { match: "microsoft.compute/virtualmachines", key: "virtual_machine" },
+  { match: "microsoft.compute/", key: "virtual_machine" },
+  { match: "microsoft.managedidentity/", key: "managed_identity" },
+  { match: "microsoft.automation/", key: "automation_account" },
+  { match: "microsoft.recoveryservices/", key: "recovery_vault" },
+  { match: "microsoft.apimanagement/", key: "api_management" },
+  { match: "microsoft.eventhub/", key: "event_hub" },
+  { match: "microsoft.servicebus/", key: "service_bus" },
+  { match: "microsoft.logic/", key: "logic_app" },
+  { match: "microsoft.datafactory/", key: "data_factory" },
+  { match: "microsoft.cognitiveservices/", key: "cognitive_services" },
+  { match: "microsoft.search/", key: "search_service" }
+];
+function matchArmType(lowerKey) {
+  for (var i = 0; i < ARM_TYPE_RULES.length; i++) {
+    if (lowerKey.indexOf(ARM_TYPE_RULES[i].match) !== -1) return ARM_TYPE_RULES[i];
+  }
+  return null;
+}
+function prettyTypeName(rawType) {
+  var seg = (rawType || "").split("/").pop() || rawType || "Unknown";
+  seg = seg.replace(/[-_]/g, " ");
+  return seg.replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+}
+function hashColor(str) {
+  var hash = 0;
+  for (var i = 0; i < str.length; i++) { hash = (hash * 31 + str.charCodeAt(i)) >>> 0; }
+  return "hsl(" + (hash % 360) + ", 60%, 50%)";
+}
+var _typeMetaCache = {};
+function typeMeta(rawType) {
+  var lowerKey = (rawType || "unknown").toLowerCase();
+  if (_typeMetaCache[lowerKey]) return _typeMetaCache[lowerKey];
+  var meta;
+  if (RESOURCE_TYPE_BY_KEY[lowerKey]) {
+    meta = RESOURCE_TYPE_BY_KEY[lowerKey];
+  } else {
+    var rule = matchArmType(lowerKey);
+    if (rule && RESOURCE_TYPE_BY_KEY[rule.key]) {
+      meta = RESOURCE_TYPE_BY_KEY[rule.key];
+    } else if (!lowerKey || lowerKey === "unknown") {
+      meta = RESOURCE_TYPE_BY_KEY.unknown;
+    } else {
+      meta = { key: lowerKey, name: prettyTypeName(rawType), icon: "◆", color: hashColor(lowerKey) };
+    }
+  }
+  _typeMetaCache[lowerKey] = meta;
+  return meta;
+}
+function healthColor(status) {
+  var s = (status || "").toLowerCase();
+  if (["critical", "error", "failed", "stopped", "offline", "unavailable"].indexOf(s) !== -1) return "#e74c3c";
+  if (["warning", "degraded", "unhealthy"].indexOf(s) !== -1) return "#f1c40f";
+  if (["healthy", "running", "active", "online", "succeeded", "available"].indexOf(s) !== -1) return "#2ecc71";
+  return "#5c6370";
+}
+function truncateLabel(text, maxLen) {
+  text = text || "";
+  return text.length > maxLen ? text.slice(0, maxLen - 1) + "…" : text;
+}
+// A resource node's fill used to be a flat near-black (#171b24, barely distinguishable from the
+// page background) with only a thin border/icon carrying any color - the node body itself read as
+// dim/lifeless. Tinting the fill with the resource's own type color (at low alpha, so the icon
+// and border still stand out clearly on top) makes each node visibly brighter/more colorful
+// without changing what color represents what type.
+function hexToRgba(hex, alpha) {
+  if (!hex || hex.charAt(0) !== "#" || hex.length < 7) return "rgba(255,255,255," + alpha + ")";
+  var r = parseInt(hex.slice(1, 3), 16);
+  var g = parseInt(hex.slice(3, 5), 16);
+  var b = parseInt(hex.slice(5, 7), 16);
+  return "rgba(" + r + "," + g + "," + b + "," + alpha + ")";
+}
+
+// --- Tree building: Subscription -> Resource Groups -> Resource Types -> Resources -------------
+var SUBSCRIPTION_ID = "__subscription__";
+function rgNodeId(rgName) { return "rg::" + rgName; }
+function typeNodeId(rgName, typeKey) { return "rg::" + rgName + "::" + typeKey; }
+
+function buildTree(resources, subscriptionLabel) {
+  var byId = {};
+  var parentOf = {};
+
+  var rgOrder = [];
+  var rgIndex = {};
+  resources.forEach(function (r) {
+    var rgName = r.resource_group || "(no resource group)";
+    if (!rgIndex[rgName]) { rgIndex[rgName] = { name: rgName, resources: [] }; rgOrder.push(rgName); }
+    rgIndex[rgName].resources.push(r);
+  });
+
+  var rgChildren = [];
+  rgOrder.forEach(function (rgName) {
+    var rgId = rgNodeId(rgName);
+    var group = rgIndex[rgName];
+
+    var typeOrder = [];
+    var typeIndex = {};
+    group.resources.forEach(function (r) {
+      var meta = typeMeta(r.type);
+      if (!typeIndex[meta.key]) { typeIndex[meta.key] = { meta: meta, resources: [] }; typeOrder.push(meta.key); }
+      typeIndex[meta.key].resources.push(r);
+    });
+
+    var typeChildIds = [];
+    typeOrder.forEach(function (typeKey) {
+      var bucket = typeIndex[typeKey];
+      var tId = typeNodeId(rgName, typeKey);
+      var resourceChildIds = bucket.resources.map(function (r) {
+        var rid = r.id || r.resource_id;
+        byId[rid] = { id: rid, kind: "resource", label: r.name || rid, resource: r, count: 1, childIds: null };
+        parentOf[rid] = tId;
+        return rid;
+      });
+      byId[tId] = {
+        id: tId, kind: "type", label: bucket.meta.name, meta: bucket.meta,
+        count: resourceChildIds.length, childIds: resourceChildIds
+      };
+      parentOf[tId] = rgId;
+      typeChildIds.push(tId);
+    });
+
+    byId[rgId] = {
+      id: rgId, kind: "resource_group", label: rgName, count: group.resources.length,
+      childIds: typeChildIds, resources: group.resources
+    };
+    parentOf[rgId] = SUBSCRIPTION_ID;
+    rgChildren.push(rgId);
+  });
+
+  byId[SUBSCRIPTION_ID] = { id: SUBSCRIPTION_ID, kind: "subscription", label: subscriptionLabel, count: resources.length, childIds: rgChildren };
+
+  return { byId: byId, parentOf: parentOf, rootId: SUBSCRIPTION_ID };
+}
+
+function ancestorChainOf(tree, nodeId) {
+  var chain = [];
+  var cur = tree.parentOf[nodeId];
+  var guard = 0;
+  while (cur && guard < 10) { chain.push(cur); cur = tree.parentOf[cur]; guard++; }
+  return chain;
+}
+
+// --- Per-node visual style (fully resolved up front - no G6 style-mapper ambiguity) --------------
+var NODE_SIZE = {
+  subscription: [230, 54],
+  resource_group: [210, 50],
+  type: [190, 46],
+  resource: [180, 44]
+};
+
+// "Network" renders every kind as a large, uniform circle instead of the tree-chrome rect
+// (chevron/badge/dashed border) the other three layouts use - see styleForGroupNode/
+// styleForResourceNode's `network` branch below.
+var NETWORK_NODE_DIAMETER = { subscription: 30, resource_group: 28, type: 26, resource: 24 };
+
+function groupMeta(node) {
+  if (node.kind === "subscription") return RESOURCE_TYPE_BY_KEY.subscription;
+  if (node.kind === "resource_group") return RESOURCE_TYPE_BY_KEY.resource_group;
+  return node.meta;
+}
+
+// Hierarchical flows left-to-right (see LAYOUT_PRESETS.hierarchical's rankdir "LR") so its
+// labels sit to the node's right instead of underneath - a below-node label would eat into the
+// vertical gap between siblings stacked along that same axis. Tree/Radial keep the simpler
+// bottom placement since they don't stack siblings along the label's axis.
+function nonNetworkLabelPlacement() {
+  return vizType === "hierarchical" ? "right" : "bottom";
+}
+// Matches the edge routing to the active flow direction: a vertical cubic curve looks bent and
+// wrong on a left-to-right hierarchy, and vice versa for Tree's top-down flow.
+function nonNetworkEdgeType() {
+  return vizType === "hierarchical" ? "cubic-horizontal" : "cubic-vertical";
+}
+
+// `emphasized` marks a group node as an ancestor of the currently-selected resource (see
+// highlightedAncestorNodeIdsFor) - a soft glow + slightly thicker border, never a fill/icon
+// color change, so the relationship path is easy to follow without losing the type-identity
+// coloring the rest of the graph relies on. `dimmed` marks it as unrelated to the current
+// selection (irrelevant unless something is selected).
+function styleForGroupNode(node, expanded, network, emphasized, dimmed) {
+  var meta = groupMeta(node);
+  if (network) {
+    // Uniform, clean circular treatment: no chevron/badge chrome, label hidden by default
+    // (see refreshZoomDependentLabels/computeVisibleG6Data), just a bigger node for anything
+    // with more members so dense hubs read as visually more important.
+    var diameter = (NETWORK_NODE_DIAMETER[node.kind] || NETWORK_NODE_DIAMETER.resource_group) + Math.min(10, Math.log(node.count + 1) * 2.2);
+    return {
+      size: diameter,
+      fill: "rgba(255,255,255,0.06)",
+      stroke: meta.color,
+      lineWidth: emphasized ? 3.5 : 2,
+      labelText: "",
+      labelFill: "#e6e6e6",
+      labelFontSize: 11,
+      labelPlacement: "bottom",
+      labelBackground: true,
+      labelBackgroundFill: "rgba(14,17,23,0.75)",
+      icon: true,
+      iconText: meta.icon,
+      iconFontFamily: "Segoe UI Emoji, Segoe UI Symbol, sans-serif",
+      iconFill: meta.color,
+      badge: false,
+      opacity: dimmed ? 0.25 : 1,
+      shadowColor: emphasized ? "rgba(255,107,107,0.6)" : undefined,
+      shadowBlur: emphasized ? 14 : 0,
+      cursor: "pointer"
+    };
+  }
+  var chevron = expanded ? "▼" : "▶";
+  return {
+    size: NODE_SIZE[node.kind] || NODE_SIZE.resource_group,
+    fill: "rgba(255,255,255,0.04)",
+    stroke: meta.color,
+    lineWidth: emphasized ? 3.5 : 2,
+    lineDash: [4, 3],
+    radius: 8,
+    labelText: chevron + " " + truncateLabel(node.label, 24) + "  (" + node.count + ")",
+    labelFill: "#e6e6e6",
+    labelFontSize: 12,
+    labelFontWeight: 600,
+    labelPlacement: nonNetworkLabelPlacement(),
+    icon: true,
+    iconText: meta.icon,
+    iconFontFamily: "Segoe UI Emoji, Segoe UI Symbol, sans-serif",
+    iconFill: meta.color,
+    badge: true,
+    badges: [{ text: String(node.count), placement: "right-top", fill: "#ffffff", backgroundFill: meta.color }],
+    opacity: dimmed ? 0.3 : 1,
+    shadowColor: emphasized ? "rgba(255,107,107,0.5)" : undefined,
+    shadowBlur: emphasized ? 12 : 0,
+    cursor: "pointer"
+  };
+}
+
+function styleForResourceNode(node, selected, matched, dimmed, network) {
+  var r = node.resource;
+  var meta = typeMeta(r.type);
+  var border = selected ? "#FF6B6B" : healthColor(r.health_status);
+  // Labels are intentionally omitted for most resources - with 800-1000+ resources, permanently
+  // drawing every label both clutters the view and is expensive to lay out/measure. The name is
+  // surfaced via the hover tooltip (see the "tooltip" plugin), on selection, on a search/filter
+  // match, and once the user has zoomed in far enough that there's room to read them without
+  // collisions (zoomLabelsVisible, refreshed by refreshZoomDependentLabels()).
+  var showLabel = selected || matched || zoomLabelsVisible;
+  if (network) {
+    return {
+      size: NETWORK_NODE_DIAMETER.resource,
+      fill: hexToRgba(meta.color, 0.32),
+      stroke: border,
+      lineWidth: selected ? 3.5 : 2,
+      labelText: showLabel ? truncateLabel(node.label, 22) : "",
+      labelFill: "#e6e6e6",
+      labelFontSize: 11,
+      labelPlacement: "bottom",
+      labelBackground: true,
+      labelBackgroundFill: "rgba(14,17,23,0.75)",
+      icon: true,
+      iconText: meta.icon,
+      iconFontFamily: "Segoe UI Emoji, Segoe UI Symbol, sans-serif",
+      iconFill: meta.color,
+      badge: false,
+      opacity: dimmed ? 0.15 : 1,
+      shadowColor: matched ? "rgba(46,204,113,0.75)" : undefined,
+      shadowBlur: matched ? 16 : 0,
+      cursor: "pointer"
+    };
+  }
+  return {
+    size: NODE_SIZE.resource,
+    fill: hexToRgba(meta.color, 0.28),
+    stroke: border,
+    lineWidth: selected ? 4 : 3,
+    radius: 8,
+    labelText: showLabel ? truncateLabel(node.label, 22) : "",
+    labelFill: "#e6e6e6",
+    labelFontSize: 11,
+    labelPlacement: nonNetworkLabelPlacement(),
+    icon: true,
+    iconText: meta.icon,
+    iconFontFamily: "Segoe UI Emoji, Segoe UI Symbol, sans-serif",
+    iconFill: meta.color,
+    badge: false,
+    opacity: dimmed ? 0.25 : 1,
+    shadowColor: matched ? "rgba(46,204,113,0.6)" : undefined,
+    shadowBlur: matched ? 12 : 0,
+    cursor: "pointer"
+  };
+}
+
+// --- Visualization presets ----------------------------------------------------------------------
+// All presets operate on the exact same in-memory tree/subset already computed by
+// computeVisibleG6Data - switching between them never touches Azure or re-fetches data.
+//
+// Exactly four visualizations, each a genuinely different shape rather than variations on the
+// same tree/force idea:
+//   - hierarchical: layered left-to-right (Subscription -> RG -> Type -> Resource)
+//   - tree:         top-down dendrogram (same hierarchy, opposite flow/shape from hierarchical)
+//   - network:      force-directed, resources as the main nodes, clustered by Resource Group
+//   - radial:       concentric rings around the Subscription/Resource Group root
+// Network and Radial have no entry here - neither is driven by a G6 layout algorithm (G6 v5.1.1's
+// built-in "force" was tested live and left distinct nodes stacked exactly on top of each other
+// for a hub-and-spokes graph shape, and "radial" collapsed a flat sibling set into a narrow
+// wedge instead of a ring - see computeNetworkPositions/computeRadialPositions below).
+var LAYOUT_PRESETS = {
+  hierarchical: { type: "antv-dagre", rankdir: "LR", nodesep: 54, ranksep: 90 },
+  tree: { type: "dendrogram", direction: "TB", nodeSep: 30, rankSep: 70 }
+};
+var VIZ_KEYS = ["hierarchical", "tree", "network", "radial"];
+var VIZ_PREFERENCE_KEY = "g6_explorer_viz_v1";
+
+function loadVizPreference() {
+  try {
+    var stored = window.localStorage.getItem(VIZ_PREFERENCE_KEY);
+    if (stored && VIZ_KEYS.indexOf(stored) !== -1) return stored;
+  } catch (e) { /* localStorage unavailable (e.g. sandboxed iframe) - fall back to default */ }
+  return "hierarchical";
+}
+function saveVizPreference(vizKey) {
+  try { window.localStorage.setItem(VIZ_PREFERENCE_KEY, vizKey); } catch (e) { /* ignore */ }
+}
+
+// --- Radial layout (manual concentric rings) ----------------------------------------------------
+// G6 v5's built-in "radial" layout type does not hold up at this node count/shape: tested live, a
+// single flat set of ~40 siblings collapsed into a narrow angular wedge instead of spreading
+// around the full circle, with the focus node itself displaced off-center. Rather than fight that,
+// Radial computes its own simple, deterministic sunburst-style polar layout: the root at the
+// center, each depth level on its own ring, and each node's angular slice sized proportionally to
+// its visible descendant count (so a Resource Group with many resources gets proportionally more
+// arc, keeping per-node spacing roughly even at every ring). Positions are then applied the same
+// way manually-dragged positions are (see hasManualLayout/rerender) - assigned directly onto node
+// style and drawn without invoking a G6 layout algorithm at all.
+var RADIAL_MIN_RING_GAP = 130;
+var RADIAL_NODE_MARGIN = 40;
+function computeRadialPositions(nodes, edges) {
+  if (!nodes.length) return {};
+  var nodeById = {};
+  nodes.forEach(function (n) { nodeById[n.id] = n; });
+  var childrenOf = {};
+  edges.forEach(function (e) { (childrenOf[e.source] || (childrenOf[e.source] = [])).push(e.target); });
+  var rootId = nodeById[SUBSCRIPTION_ID] ? SUBSCRIPTION_ID : nodes[0].id;
+
+  var weightCache = {};
+  function weightOf(id) {
+    if (weightCache[id] !== undefined) return weightCache[id];
+    var kids = childrenOf[id];
+    var w = (!kids || !kids.length) ? 1 : kids.reduce(function (sum, kid) { return sum + weightOf(kid); }, 0);
+    weightCache[id] = w;
+    return w;
+  }
+  function nodeExtent(id) {
+    var size = nodeById[id].style.size;
+    return Array.isArray(size) ? Math.max(size[0], size[1]) : (size || 30);
+  }
+
+  // Pass 1: for every parent, how much radius its own children need so their combined arc
+  // (width + margin, across their shared angular slice) doesn't crowd them together - the ring
+  // one level deeper than that parent must be at least that big.
+  var neededRadiusByDepth = {};
+  function measure(id, depth, sliceAngle) {
+    var kids = childrenOf[id];
+    if (!kids || !kids.length) return;
+    var avgExtent = kids.reduce(function (s, k) { return s + nodeExtent(k); }, 0) / kids.length;
+    var required = (kids.length * (avgExtent + RADIAL_NODE_MARGIN)) / Math.max(sliceAngle, 0.0001);
+    neededRadiusByDepth[depth + 1] = Math.max(neededRadiusByDepth[depth + 1] || 0, required);
+    var totalWeight = kids.reduce(function (s, k) { return s + weightOf(k); }, 0) || 1;
+    kids.forEach(function (kid) { measure(kid, depth + 1, (weightOf(kid) / totalWeight) * sliceAngle); });
+  }
+  measure(rootId, 0, 2 * Math.PI);
+
+  var radiusByDepth = { 0: 0 };
+  Object.keys(neededRadiusByDepth).map(Number).sort(function (a, b) { return a - b; }).forEach(function (depth) {
+    radiusByDepth[depth] = Math.max((radiusByDepth[depth - 1] || 0) + RADIAL_MIN_RING_GAP, neededRadiusByDepth[depth]);
+  });
+
+  // Pass 2: walk the same tree again, this time actually assigning x/y from the ring radii
+  // computed above and each node's allotted angular slice.
+  var positions = {};
+  positions[rootId] = { x: 0, y: 0 };
+  function place(id, depth, angleStart, angleEnd) {
+    var kids = childrenOf[id];
+    if (!kids || !kids.length) return;
+    var totalWeight = kids.reduce(function (s, k) { return s + weightOf(k); }, 0) || 1;
+    var sliceAngle = angleEnd - angleStart;
+    var radius = radiusByDepth[depth + 1];
+    var cursor = angleStart;
+    kids.forEach(function (kid) {
+      var kidAngle = (weightOf(kid) / totalWeight) * sliceAngle;
+      var mid = cursor + kidAngle / 2;
+      positions[kid] = { x: radius * Math.cos(mid), y: radius * Math.sin(mid) };
+      place(kid, depth + 1, cursor, cursor + kidAngle);
+      cursor += kidAngle;
+    });
+  }
+  place(rootId, 0, 0, 2 * Math.PI);
+  return positions;
+}
+function applyRadialPositions(data) {
+  var positions = computeRadialPositions(data.nodes, data.edges);
+  data.nodes.forEach(function (n) {
+    var pos = positions[n.id];
+    if (pos) { n.style.x = pos.x; n.style.y = pos.y; }
+  });
+}
+
+// --- Network layout (manual force simulation) ---------------------------------------------------
+// A small, fully-controlled Fruchterman-Reingold-style simulation: all-pairs repulsion (so
+// unconnected branches spread apart with "strong spacing"), spring edges (so a resource stays
+// near its owning Resource Group/Type - the "natural clustering" the connected tree edges
+// already encode, with no separate clustering force needed), mild centering, and a final
+// hard overlap-resolution pass that guarantees no two nodes end up closer than their combined
+// radius. Runs entirely client-side on the already-loaded subset; cheap enough at the ~150-node
+// readability cap to finish well under what a user would notice.
+var NETWORK_LINK_DISTANCE = 130;
+var NETWORK_REPULSION = 26000;
+var NETWORK_ITERATIONS = 260;
+function computeNetworkPositions(nodes, edges) {
+  var n = nodes.length;
+  if (!n) return {};
+  var pos = {}, vel = {}, radiusOf = {};
+  nodes.forEach(function (node) {
+    pos[node.id] = seedNetworkPosition(node.id);
+    vel[node.id] = { x: 0, y: 0 };
+    var size = node.style.size;
+    radiusOf[node.id] = (Array.isArray(size) ? Math.max(size[0], size[1]) : (size || 30)) / 2;
+  });
+  var validEdges = edges.filter(function (e) { return pos[e.source] && pos[e.target]; });
+
+  for (var iter = 0; iter < NETWORK_ITERATIONS; iter++) {
+    var force = {};
+    nodes.forEach(function (node) { force[node.id] = { x: 0, y: 0 }; });
+
+    for (var i = 0; i < n; i++) {
+      for (var j = i + 1; j < n; j++) {
+        var a = nodes[i].id, b = nodes[j].id;
+        var dx = pos[a].x - pos[b].x, dy = pos[a].y - pos[b].y;
+        var distSq = dx * dx + dy * dy || 0.01;
+        var dist = Math.sqrt(distSq);
+        var f = NETWORK_REPULSION / distSq;
+        if (dist < radiusOf[a] + radiusOf[b] + 30) f *= 3;
+        var fx = (dx / dist) * f, fy = (dy / dist) * f;
+        force[a].x += fx; force[a].y += fy;
+        force[b].x -= fx; force[b].y -= fy;
+      }
+    }
+    validEdges.forEach(function (e) {
+      var dx = pos[e.target].x - pos[e.source].x, dy = pos[e.target].y - pos[e.source].y;
+      var dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      var f = (dist - NETWORK_LINK_DISTANCE) * 0.02;
+      var fx = (dx / dist) * f, fy = (dy / dist) * f;
+      force[e.source].x += fx; force[e.source].y += fy;
+      force[e.target].x -= fx; force[e.target].y -= fy;
+    });
+    nodes.forEach(function (node) {
+      var id = node.id;
+      force[id].x -= pos[id].x * 0.002;
+      force[id].y -= pos[id].y * 0.002;
+      vel[id].x = (vel[id].x + force[id].x) * 0.82;
+      vel[id].y = (vel[id].y + force[id].y) * 0.82;
+      pos[id].x += vel[id].x;
+      pos[id].y += vel[id].y;
+    });
+  }
+
+  // Simulation settles average spacing but doesn't strictly guarantee zero overlap - this pass
+  // directly pushes apart any pair still closer than their combined radius until none remain.
+  for (var pass = 0; pass < 40; pass++) {
+    var moved = false;
+    for (var i2 = 0; i2 < n; i2++) {
+      for (var j2 = i2 + 1; j2 < n; j2++) {
+        var a2 = nodes[i2].id, b2 = nodes[j2].id;
+        var dx2 = pos[a2].x - pos[b2].x, dy2 = pos[a2].y - pos[b2].y;
+        var dist2 = Math.sqrt(dx2 * dx2 + dy2 * dy2) || 0.01;
+        var minDist = radiusOf[a2] + radiusOf[b2] + 20;
+        if (dist2 < minDist) {
+          moved = true;
+          var push = (minDist - dist2) / 2;
+          var ux = dx2 / dist2, uy = dy2 / dist2;
+          pos[a2].x += ux * push; pos[a2].y += uy * push;
+          pos[b2].x -= ux * push; pos[b2].y -= uy * push;
+        }
+      }
+    }
+    if (!moved) break;
+  }
+  return pos;
+}
+function applyNetworkPositions(data) {
+  var positions = computeNetworkPositions(data.nodes, data.edges);
+  data.nodes.forEach(function (n) {
+    var pos = positions[n.id];
+    if (pos) { n.style.x = pos.x; n.style.y = pos.y; }
+  });
+}
+
+// --- Resource Group tooltip: "Contains" / "Purpose" / "Region" ---------------------------------
+// All three are derived purely from the actual resources in the group (never the group's own
+// name) so the tooltip describes what's really there instead of guessing from "grimlock" or
+// similar arbitrary resource-group names.
+
+// Trims a generic catalogue name down to what reads well in a short, comma-separated list
+// (e.g. "Storage Account" -> "Storage") without touching the catalogue itself (that name/icon
+// still needs to stay as-is for the graph's own node labels).
+function containsTypeName(rawType) {
+  return typeMeta(rawType).name.replace(/\s+Account$/i, "");
+}
+
+// Concise, comma-separated list of the resource group's main resource types, most-common-first
+// - capped so a resource group with many distinct types still reads as a short line, not a
+// dump of everything it contains.
+var CONTAINS_LIST_CAP = 5;
+function containsSummary(resources) {
+  var counts = {};
+  var order = [];
+  resources.forEach(function (r) {
+    var name = containsTypeName(r.type);
+    if (!counts[name]) { counts[name] = 0; order.push(name); }
+    counts[name]++;
+  });
+  order.sort(function (a, b) { return counts[b] - counts[a]; });
+  var shown = order.slice(0, CONTAINS_LIST_CAP);
+  var text = shown.join(", ");
+  if (order.length > CONTAINS_LIST_CAP) text += " +" + (order.length - CONTAINS_LIST_CAP) + " more";
+  return text || "—";
+}
+
+// Coarse category each resource type key rolls up into, used only to infer a one-line "Purpose"
+// - not shown anywhere itself, and unrelated to the graph's own per-type colors/icons.
+var PURPOSE_CATEGORY_BY_TYPE_KEY = {
+  app_service: "compute", app_service_plan: "compute", function_app: "compute",
+  static_web_app: "compute", virtual_machine: "compute", vm_scale_set: "compute",
+  availability_set: "compute", container_app: "compute", container_instance: "compute",
+  aks_cluster: "containers", container_registry: "containers",
+  sql_database: "data", postgresql: "data", mysql: "data", cosmos_db: "data",
+  redis: "data", storage_account: "data", disk: "data",
+  vnet: "networking", nsg: "networking", load_balancer: "networking",
+  application_gateway: "networking", firewall: "networking", bastion: "networking",
+  vpn_gateway: "networking", public_ip: "networking", network_interface: "networking",
+  private_endpoint: "networking", dns_zone: "networking", cdn_front_door: "networking",
+  traffic_manager: "networking",
+  log_analytics: "monitoring", application_insights: "monitoring", azure_monitor: "monitoring",
+  key_vault: "security", managed_identity: "security",
+  automation_account: "management", recovery_vault: "management",
+  data_factory: "integration", event_hub: "integration", service_bus: "integration",
+  logic_app: "integration", api_management: "integration",
+  cognitive_services: "ai", search_service: "ai"
+};
+
+// Priority-ordered: the first matching combination wins, so e.g. a group with both compute and
+// data resources reads as "Application infrastructure" rather than falling through to a vaguer
+// single-category label.
+function purposeFor(resources) {
+  var counts = {};
+  resources.forEach(function (r) {
+    var category = PURPOSE_CATEGORY_BY_TYPE_KEY[typeMeta(r.type).key] || "other";
+    counts[category] = (counts[category] || 0) + 1;
+  });
+  var has = function (category) { return !!counts[category]; };
+
+  if (has("compute") && has("data")) return "Application infrastructure";
+  if (has("containers")) return "Container platform infrastructure";
+  if (has("compute")) return "Compute infrastructure";
+  if (has("data")) return "Data & storage infrastructure";
+  if (has("networking")) return "Networking infrastructure";
+  if (has("monitoring")) return "Monitoring & observability infrastructure";
+  if (has("security")) return "Security & identity infrastructure";
+  if (has("integration")) return "Data integration infrastructure";
+  if (has("ai")) return "AI / cognitive services infrastructure";
+  if (has("management")) return "Backup & management infrastructure";
+  return "General purpose infrastructure";
+}
+
+// Most-common region among the group's resources (a resource group isn't itself pinned to one
+// region, so its resources occasionally span more than one) - named directly, with a "+N more"
+// qualifier only when that's actually true.
+function dominantRegion(resources) {
+  var counts = {};
+  var order = [];
+  resources.forEach(function (r) {
+    var region = r.region || r.location || "Unknown";
+    if (!counts[region]) { counts[region] = 0; order.push(region); }
+    counts[region]++;
+  });
+  if (!order.length) return "Unknown";
+  order.sort(function (a, b) { return counts[b] - counts[a]; });
+  return order.length > 1 ? (order[0] + " (+" + (order.length - 1) + " more)") : order[0];
+}
+
+function tooltipKeyValueRow(label, value) {
+  var line = document.createElement("div");
+  line.style.cssText = "margin-top:2px;";
+  var strong = document.createElement("span");
+  strong.style.cssText = "font-weight:600;color:#dfe2eb;";
+  strong.textContent = label + ": ";
+  var val = document.createElement("span");
+  val.style.cssText = "color:#c7cbd6;";
+  val.textContent = value;
+  line.appendChild(strong);
+  line.appendChild(val);
+  return line;
+}
+
+function buildResourceGroupTooltipContent(node) {
+  var resources = node.resources || [];
+  var wrap = document.createElement("div");
+  wrap.style.cssText = "padding:6px 10px;font-size:12px;line-height:1.55;max-width:300px;";
+
+  var title = document.createElement("div");
+  title.style.cssText = "font-weight:600;font-size:13px;margin-bottom:2px;";
+  title.textContent = node.label;
+  wrap.appendChild(title);
+
+  var sub = document.createElement("div");
+  sub.style.cssText = "color:#a9afc0;margin-bottom:5px;";
+  sub.textContent = RESOURCE_TYPE_BY_KEY.resource_group.icon + " Resource Group · " + node.count + " resource" + (node.count === 1 ? "" : "s");
+  wrap.appendChild(sub);
+
+  if (resources.length) {
+    wrap.appendChild(tooltipKeyValueRow("Contains", containsSummary(resources)));
+    wrap.appendChild(tooltipKeyValueRow("Purpose", purposeFor(resources)));
+    wrap.appendChild(tooltipKeyValueRow("Region", dominantRegion(resources)));
+  }
+
+  return wrap;
+}
+
+// Covers every node kind (not just resource leaves) so truncated Resource Group/Type labels
+// still expose their full name on hover, same as resource names do.
+function buildTooltipContent(evt) {
+  var id = evt && evt.target && evt.target.id;
+  if (!id || !tree) return "";
+  var node = tree.byId[id];
+  if (!node) return "";
+  if (node.kind === "resource_group") return buildResourceGroupTooltipContent(node);
+  var wrap = document.createElement("div");
+  wrap.style.cssText = "padding:6px 10px;font-size:12px;line-height:1.5;max-width:280px;";
+  var title = document.createElement("div");
+  title.style.cssText = "font-weight:600;font-size:13px;margin-bottom:2px;";
+  title.textContent = node.label;
+  var sub = document.createElement("div");
+  sub.style.cssText = "color:#a9afc0;";
+  if (node.kind === "resource") {
+    var r = node.resource;
+    var meta = typeMeta(r.type);
+    sub.textContent = meta.icon + " " + meta.name + (r.resource_group ? " · " + r.resource_group : "");
+  } else {
+    var groupMetaInfo = groupMeta(node);
+    sub.textContent = groupMetaInfo.icon + " " + groupMetaInfo.name + " · " + node.count + " resource" + (node.count === 1 ? "" : "s");
+  }
+  wrap.appendChild(title);
+  wrap.appendChild(sub);
+  return wrap;
+}
+
+// Click tooltip/card for resource (leaf) nodes only - group nodes (Subscription/Resource
+// Group/Type) keep just the hover tooltip above, no card on click. Composed entirely from
+// fields Resource Graph already returns for every resource (name/type/resource_group/
+// region/state) - there's no free-text description field on an ARM resource, so the
+// "description" line is phrased from that same existing data rather than an invented string
+// or an extra Azure API call.
+function buildResourceClickCardContent(evt) {
+  var id = evt && evt.target && evt.target.id;
+  if (!id || !tree) return "";
+  var node = tree.byId[id];
+  if (!node || node.kind !== "resource") return "";
+  var r = node.resource;
+  var meta = typeMeta(r.type);
+  var resourceGroup = r.resource_group || "Unknown";
+  var region = r.region || r.location || "Unknown";
+  var status = r.state || r.health_status || "Unknown";
+
+  function row(label, value) {
+    var line = document.createElement("div");
+    line.style.cssText = "margin-top:3px;";
+    var strong = document.createElement("span");
+    strong.style.cssText = "font-weight:600;color:#dfe2eb;";
+    strong.textContent = label + ": ";
+    var val = document.createElement("span");
+    val.style.cssText = "color:#c7cbd6;";
+    val.textContent = value;
+    line.appendChild(strong);
+    line.appendChild(val);
+    return line;
+  }
+
+  var wrap = document.createElement("div");
+  wrap.style.cssText = "padding:8px 12px;font-size:12px;line-height:1.55;max-width:320px;min-width:230px;";
+
+  var title = document.createElement("div");
+  title.style.cssText = "font-weight:700;font-size:13.5px;margin-bottom:3px;";
+  title.textContent = r.name || node.label;
+  wrap.appendChild(title);
+
+  wrap.appendChild(row("Type", meta.name));
+
+  var desc = document.createElement("div");
+  desc.style.cssText = "color:#a9afc0;margin:4px 0 5px;";
+  desc.textContent = meta.icon + " " + meta.name + " in " + resourceGroup + " (" + region + ")";
+  wrap.appendChild(desc);
+
+  wrap.appendChild(row("Resource Group", resourceGroup));
+  wrap.appendChild(row("Region", region));
+  wrap.appendChild(row("Status/Health", status));
+
+  return wrap;
+}
+
+// --- Component state --------------------------------------------------------------------------
+var graph = null;
+var tree = null;
+var expandedIds = new Set();
+var selectedId = null;
+var search = "";
+var typeFilter = "";
+var healthFilter = "";
+var lastResourcesKey = null;
+var lastSelectedIdArg = null;
+var vizType = loadVizPreference();
+// Large datasets (the 800-1000 resource case this component targets) start fully collapsed
+// down to Resource Groups so the initial paint is a compact overview, not the whole subscription.
+var LARGE_DATASET_THRESHOLD = 50;
+
+// --- Manual node positioning ---------------------------------------------------------------
+// id -> {x,y} for every node's last-known position (kept in sync after every automatic layout,
+// and overwritten for a node the instant it's dragged). Once hasManualLayout is true, rerender()
+// stops invoking the layout algorithm altogether and just restores these cached coordinates, so a
+// user's manual arrangement survives search/filter/expand-collapse instead of being reset.
+var nodePositions = {};
+var hasManualLayout = false;
+
+// --- Zoom-dependent resource labels -------------------------------------------------------------
+// Resource (leaf) labels are hidden by default (see styleForResourceNode) and only turned on once
+// zoomed in past this level - there's finally enough on-screen space per node to show a label
+// without it colliding with its neighbors. Group-level (Subscription/Resource Group/Type) labels
+// are exempt and always show, per requirement - except in Network mode, where every kind stays
+// hidden-by-default like a resource (see styleForGroupNode's `network` branch).
+var ZOOM_LABEL_THRESHOLD = 0.65;
+var zoomLabelsVisible = false;
+
+// --- Readability cap for the "overview" visualizations -------------------------------------------
+// Radial/Network are meant to stay a clean high-level overview, not a full resource drill-down
+// (that's what Hierarchical/Tree are for) - if the user's expand state would put more than this
+// many nodes on screen in one of these views, automatically collapse the deepest expanded level
+// rather than rendering an unreadable/unresponsive tangle. An active search/filter is exempt so
+// "search still finds and focuses a collapsed resource" keeps working.
+var CLUTTER_PRONE_VIZ = { radial: true, network: true };
+var READABILITY_NODE_CAP = 150;
+
+function computeMatches() {
+  var q = search.trim().toLowerCase();
+  if (!q && !typeFilter && !healthFilter) return null;
+  var out = {};
+  Object.keys(tree.byId).forEach(function (id) {
+    var node = tree.byId[id];
+    if (node.kind !== "resource") return;
+    var r = node.resource;
+    var meta = typeMeta(r.type);
+    if (q) {
+      var hay = [r.name, r.type, meta.name, r.resource_group].join(" ").toLowerCase();
+      if (hay.indexOf(q) === -1) return;
+    }
+    if (typeFilter && meta.key !== typeFilter) return;
+    if (healthFilter) {
+      var status = (r.health_status || "").toLowerCase();
+      var isHealthy = ["healthy", "running", "active", "online", "succeeded", "available"].indexOf(status) !== -1;
+      var isCritical = ["critical", "error", "failed", "stopped", "offline", "unavailable"].indexOf(status) !== -1;
+      var isWarning = ["warning", "degraded", "unhealthy"].indexOf(status) !== -1;
+      if (healthFilter === "healthy" && !isHealthy) return;
+      if (healthFilter === "warning" && !isWarning) return;
+      if (healthFilter === "critical" && !isCritical) return;
+    }
+    out[id] = true;
+  });
+  return out;
+}
+
+function expandAncestorsOf(id) {
+  ancestorChainOf(tree, id).forEach(function (a) { expandedIds.add(a); });
+}
+
+// See CLUTTER_PRONE_VIZ/READABILITY_NODE_CAP above. Mutates expandedIds directly (same mechanism
+// Expand All/Collapse All use) so every other code path (fitView, compaction, perf badge) keeps
+// working unchanged - this just quietly un-expands nodes before the visible set is computed.
+function enforceReadabilityCap(matches) {
+  if (!CLUTTER_PRONE_VIZ[vizType] || matches) return;
+  if (computeVisibleG6Data(null).nodes.length <= READABILITY_NODE_CAP) return;
+  var collapsedAny = false;
+  Object.keys(tree.byId).forEach(function (id) {
+    if (tree.byId[id].kind === "type" && expandedIds.has(id)) { expandedIds.delete(id); collapsedAny = true; }
+  });
+  if (!collapsedAny || computeVisibleG6Data(null).nodes.length <= READABILITY_NODE_CAP) return;
+  Object.keys(tree.byId).forEach(function (id) {
+    if (tree.byId[id].kind === "resource_group" && expandedIds.has(id)) expandedIds.delete(id);
+  });
+}
+
+// Snapshots every currently-rendered node's data-space position. Used both to detect "has this
+// node moved since the last automatic layout" and, once hasManualLayout is true, as the source of
+// truth rerender() restores positions from instead of re-running the layout algorithm.
+function syncNodePositions() {
+  var nd;
+  try { nd = graph.getNodeData(); } catch (e) { return; }
+  nd.forEach(function (n) {
+    if (n.style && typeof n.style.x === "number" && typeof n.style.y === "number") {
+      nodePositions[n.id] = { x: n.style.x, y: n.style.y };
+    }
+  });
+}
+
+// Placement for nodes that have never been laid out before - e.g. a Resource Group's children
+// revealed by clicking to expand it while in manual-layout mode (see toggleExpand/rerender).
+// Batched per parent (not one node at a time) so a parent's whole new child set is arranged as a
+// single clean fan/ring around that parent's own current position - never at the graph's origin,
+// never disturbing any already-placed node, and never invoking a real layout algorithm.
+function nodeExtentOf(nodeId) {
+  var node = tree.byId[nodeId];
+  if (!node) return 60;
+  var size = node.kind === "resource" ? NODE_SIZE.resource : (NODE_SIZE[node.kind] || NODE_SIZE.resource_group);
+  return Array.isArray(size) ? Math.max(size[0], size[1]) : size;
+}
+function placeNewNodesAround(newNodeIds) {
+  var byParent = {};
+  var parentOrder = [];
+  newNodeIds.forEach(function (id) {
+    var parentId = tree.parentOf[id] || "__root__";
+    if (!byParent[parentId]) { byParent[parentId] = []; parentOrder.push(parentId); }
+    byParent[parentId].push(id);
+  });
+  parentOrder.forEach(function (parentId) {
+    var children = byParent[parentId];
+    var parentPos = nodePositions[parentId] || { x: 0, y: 0 };
+    var avgExtent = children.reduce(function (sum, id) { return sum + nodeExtentOf(id); }, 0) / children.length;
+    var spacing = avgExtent + 30;
+    var baseRadius = avgExtent / 2 + 110;
+    var ringGap = avgExtent + 70;
+    var placed = 0;
+    var ring = 0;
+    while (placed < children.length) {
+      var radius = baseRadius + ring * ringGap;
+      var capacity = Math.max(1, Math.floor((2 * Math.PI * radius) / spacing));
+      var countThisRing = Math.min(capacity, children.length - placed);
+      var angleOffset = ring * 0.6; // stagger successive rings so their nodes don't align radially
+      for (var i = 0; i < countThisRing; i++) {
+        var angle = angleOffset + (2 * Math.PI * i) / countThisRing;
+        var id = children[placed + i];
+        var tentative = { x: parentPos.x + radius * Math.cos(angle), y: parentPos.y + radius * Math.sin(angle) };
+        nodePositions[id] = resolveAgainstExistingPositions(tentative, id);
+      }
+      placed += countThisRing;
+      ring++;
+    }
+  });
+}
+// Nudges a tentative position away from any already-placed node it would land on top of, using
+// BOTH nodes' own extents to size the required gap (not just the new node's) - otherwise a new
+// small resource node could still end up too close to an existing large group node. Cheap
+// iterative relaxation (not a physics sim) - only ever runs over the handful of nodes a single
+// expand click reveals, checked against the already-known position of every visible node
+// (including siblings placed earlier in the very same batch).
+function resolveAgainstExistingPositions(pos, movingId) {
+  var selfExtent = nodeExtentOf(movingId);
+  for (var pass = 0; pass < 30; pass++) {
+    var moved = false;
+    for (var id in nodePositions) {
+      var other = nodePositions[id];
+      var requiredGap = (selfExtent + nodeExtentOf(id)) / 2 + 32;
+      var dx = pos.x - other.x, dy = pos.y - other.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < requiredGap) {
+        var angle = dist > 0.01 ? Math.atan2(dy, dx) : 0.7;
+        pos = { x: other.x + Math.cos(angle) * requiredGap, y: other.y + Math.sin(angle) * requiredGap };
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  return pos;
+}
+
+// Polled rather than tied to a specific zoom-trigger event (wheel, pinch, the Zoom In/Out
+// buttons, fitView's own animated zoom) so every way of changing zoom is covered uniformly.
+// Cheap: skips all work unless the show/hide threshold was actually crossed since the last tick.
+function refreshZoomDependentLabels() {
+  if (!graph || !tree) return;
+  var zoom = graph.getZoom ? graph.getZoom() : 1;
+  var showAll = zoom >= ZOOM_LABEL_THRESHOLD;
+  if (showAll === zoomLabelsVisible) return;
+  zoomLabelsVisible = showAll;
+  var nd;
+  try { nd = graph.getNodeData(); } catch (e) { return; }
+  var updates = [];
+  var network = vizType === "network";
+  // Recomputed here (not just `selected`) so a node the user is currently searching/filtering
+  // for doesn't have its label incorrectly cleared the moment a zoom-threshold crossing fires -
+  // matches computeMatches()'s definition of "visible" exactly as styleForResourceNode does.
+  var matches = computeMatches();
+  nd.forEach(function (n) {
+    var node = tree.byId[n.id];
+    if (!node) return;
+    if (node.kind !== "resource" && !network) return; // group labels always show outside Network
+    var selected = n.id === selectedId;
+    var matched = !!(matches && matches[n.id]);
+    var newLabel;
+    if (node.kind === "resource") {
+      newLabel = (selected || matched || zoomLabelsVisible) ? truncateLabel(node.label, 22) : "";
+    } else {
+      newLabel = (network && !(selected || matched || zoomLabelsVisible)) ? "" : n.style.labelText;
+    }
+    if (n.style && n.style.labelText === newLabel) return;
+    updates.push({ id: n.id, style: { labelText: newLabel } });
+  });
+  if (updates.length) { graph.updateNodeData(updates); graph.draw(); }
+}
+setInterval(refreshZoomDependentLabels, 300);
+
+// Builds the G6-format {nodes, edges} for exactly what should currently be drawn - a node's
+// subtree is included only if every ancestor down to it is expanded. This (not G6's own
+// collapsed-node bookkeeping) is what keeps layout/draw cost proportional to what's visible
+// instead of the full 800-1000+ resource set.
+// Cluster key for Network's force-clustering only (the other five layouts keep their existing
+// `tree.parentOf[nodeId] || nodeId` behavior unchanged). Using the immediate parent for every
+// kind would put every Resource Group under one Subscription into a single shared cluster (they
+// all share that same parent id), pulling all of them into one blob instead of each resource
+// staying grouped with its own Resource Group - exactly the "one giant cluster" the Network
+// view needs to avoid. A Resource Group is its own cluster anchor; a resource's cluster is its
+// owning Resource Group.
+function networkClusterKeyFor(nodeId) {
+  var node = tree.byId[nodeId];
+  if (!node || node.kind !== "resource") return nodeId;
+  return tree.parentOf[nodeId] || nodeId;
+}
+
+// Network's force layout starts every unpositioned node at the same implicit default, and a
+// hub-and-spokes graph (one Subscription/Resource Group connected to many otherwise-unconnected
+// children) is symmetric enough that the simulation can converge with several distinct nodes
+// left stacked exactly on top of each other - invisible overlap that doesn't show up as "a
+// spider web" but is just as broken. Seeding a small deterministic (id-hash-based, so re-renders
+// of the same data stay stable) spread before layout runs breaks that symmetry.
+function seedNetworkPosition(id) {
+  var hash = 0;
+  for (var i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
+  // A plain polynomial hash has poor avalanche behavior: two ids differing only in a trailing
+  // digit (e.g. "rg-stage-013" vs "rg-stage-017" - an extremely common real-world Azure naming
+  // pattern) end up with hashes only a few units apart, which produced near-identical seed
+  // positions and, in turn, nodes the force layout left stacked on top of each other. This is
+  // MurmurHash3's finalizer (fmix32): a few xorshift/multiply rounds that diffuse small input
+  // differences across the whole 32-bit output.
+  hash ^= hash >>> 16;
+  hash = Math.imul(hash, 0x85ebca6b) >>> 0;
+  hash ^= hash >>> 13;
+  hash = Math.imul(hash, 0xc2b2ae35) >>> 0;
+  hash ^= hash >>> 16;
+  var angle = (hash % 6283) / 1000;
+  var radius = 20 + (hash % 300);
+  return { x: radius * Math.cos(angle), y: radius * Math.sin(angle) };
+}
+
+// The tree here only ever encodes containment edges (Subscription->RG->Type->Resource) - there is
+// no separate dependency graph to draw on - so "direct connection/relationship edges" for a
+// selected resource is its root-to-node ancestor chain: the one edge straight to its parent, plus
+// every edge above that. Returns the set of edge ids (same "parentId->childId" format
+// computeVisibleG6Data already uses) making up that path.
+function highlightedEdgeIdsFor(nodeId) {
+  var ids = new Set();
+  if (!nodeId || !tree.byId[nodeId]) return ids;
+  var cur = nodeId;
+  var guard = 0;
+  while (tree.parentOf[cur] && guard < 10) {
+    var parent = tree.parentOf[cur];
+    ids.add(parent + "->" + cur);
+    cur = parent;
+    guard++;
+  }
+  return ids;
+}
+// The group nodes (Resource Group/Type/Subscription) along that same path - "connected nodes"
+// get a slight visual emphasis (see styleForGroupNode's `emphasized` param) without changing
+// their type-identity color/icon.
+function highlightedAncestorNodeIdsFor(nodeId) {
+  if (!nodeId || !tree.byId[nodeId]) return new Set();
+  return new Set(ancestorChainOf(tree, nodeId));
+}
+function edgeStyleFor(edgeId, network, hasSelection, highlightEdgeIds) {
+  var isHighlighted = hasSelection && highlightEdgeIds.has(edgeId);
+  if (network) {
+    if (!hasSelection) return { stroke: "#5b7a9e", lineWidth: 1, opacity: 0.22, endArrow: false };
+    return isHighlighted
+      ? {
+          stroke: "#FF6B6B", lineWidth: 3.5, opacity: 1, endArrow: false, zIndex: 5,
+          shadowColor: "rgba(255,107,107,0.85)", shadowBlur: 16
+        }
+      : { stroke: "#5b7a9e", lineWidth: 1, opacity: 0.08, endArrow: false };
+  }
+  if (!hasSelection) return { stroke: "#4a4f5c", lineWidth: 1.5, endArrow: false };
+  return isHighlighted
+    ? {
+        stroke: "#FF6B6B", lineWidth: 4, opacity: 1, endArrow: false, zIndex: 5,
+        shadowColor: "rgba(255,107,107,0.85)", shadowBlur: 16
+      }
+    : { stroke: "#4a4f5c", lineWidth: 1.5, opacity: 0.15, endArrow: false };
+}
+
+function computeVisibleG6Data(matches) {
+  var nodes = [];
+  var edges = [];
+  var network = vizType === "network";
+  // Computed once per call (not per node/edge) - selectedId never changes mid-traversal.
+  var highlightEdgeIds = highlightedEdgeIdsFor(selectedId);
+  var highlightAncestorIds = highlightedAncestorNodeIdsFor(selectedId);
+  var hasSelection = highlightEdgeIds.size > 0;
+  function visit(nodeId) {
+    var node = tree.byId[nodeId];
+    if (!node) return;
+    if (node.kind === "resource") {
+      var isSelected = nodeId === selectedId;
+      // Dimmed if it's a search/filter mismatch OR (a resource is selected and this isn't it) -
+      // a resource never has another resource as a "direct connection" in this tree (its only
+      // edge is to its own parent), so every other resource is "unrelated" the moment one is
+      // selected.
+      var dimmed = (matches ? !matches[nodeId] : false) || (hasSelection && !isSelected);
+      var resourceStyle = styleForResourceNode(node, isSelected, !!(matches && matches[nodeId]), dimmed, network);
+      if (network) Object.assign(resourceStyle, seedNetworkPosition(nodeId));
+      nodes.push({
+        id: nodeId, type: network ? "circle" : "rect",
+        data: { cluster: network ? networkClusterKeyFor(nodeId) : (tree.parentOf[nodeId] || nodeId) },
+        style: resourceStyle
+      });
+      return;
+    }
+    var expanded = expandedIds.has(nodeId);
+    var emphasized = highlightAncestorIds.has(nodeId);
+    // A group node is "unrelated" once something is selected unless it's on that resource's own
+    // ancestor path (the Resource Group/Type/Subscription actually connecting to it).
+    var groupDimmed = hasSelection && !emphasized;
+    var groupStyle = styleForGroupNode(node, expanded, network, emphasized, groupDimmed);
+    if (network) Object.assign(groupStyle, seedNetworkPosition(nodeId));
+    nodes.push({
+      id: nodeId, type: network ? "circle" : "rect",
+      data: { cluster: network ? networkClusterKeyFor(nodeId) : (tree.parentOf[nodeId] || nodeId) },
+      style: groupStyle
+    });
+    if (expanded && node.childIds) {
+      node.childIds.forEach(function (childId) {
+        var edgeId = nodeId + "->" + childId;
+        edges.push({
+          id: edgeId, source: nodeId, target: childId,
+          type: network ? "line" : nonNetworkEdgeType(),
+          style: edgeStyleFor(edgeId, network, hasSelection, highlightEdgeIds)
+        });
+        visit(childId);
+      });
+    }
+  }
+  visit(tree.rootId);
+  return { nodes: nodes, edges: edges };
+}
+
+function rerender() {
+  var renderStart = performance.now();
+  var matches = computeMatches();
+  if (matches) {
+    Object.keys(matches).forEach(function (id) { expandAncestorsOf(id); });
+  }
+  enforceReadabilityCap(matches);
+  var data = computeVisibleG6Data(matches);
+
+  if (hasManualLayout) {
+    // The user has taken manual control of node positions (by dragging, or by expanding/
+    // collapsing a group - see toggleExpand): restore every node's last-known position instead
+    // of invoking the active layout algorithm (which would discard that arrangement and jump/
+    // recenter the whole view), and fan brand-new nodes (e.g. from expanding a group) out around
+    // their own parent's position rather than running a real layout pass.
+    var newIds = data.nodes.map(function (n) { return n.id; }).filter(function (id) { return !nodePositions[id]; });
+    if (newIds.length) placeNewNodesAround(newIds);
+    data.nodes.forEach(function (n) {
+      var pos = nodePositions[n.id];
+      n.style.x = pos.x;
+      n.style.y = pos.y;
+    });
+    graph.setData(data);
+    graph.draw();
+    syncNodePositions();
+    var manualMs = (performance.now() - renderStart).toFixed(1);
+    document.getElementById("perfBadge").textContent =
+      Object.keys(tree.byId).length - 1 + " resources discovered · " + data.nodes.length + " nodes rendered (manual layout) · " + manualMs + "ms";
+    console.log("[g6_explorer] G6 render (manual layout, draw only): " + manualMs + "ms for " + data.nodes.length + " nodes");
+    return;
+  }
+
+  if (vizType === "radial" || vizType === "network") {
+    // Neither is a G6-algorithm layout (see computeRadialPositions/computeNetworkPositions) -
+    // positions are computed up front and just drawn, the same way a manual/dragged arrangement is.
+    if (vizType === "radial") applyRadialPositions(data); else applyNetworkPositions(data);
+    graph.setData(data);
+    // graph.draw() returns a Promise - fitView (inside afterLayoutSettled) needs to run after
+    // the draw actually completes, otherwise it can compute against an empty/stale element
+    // registry and silently no-op (leaving zoom at its previous value).
+    Promise.resolve(graph.draw()).then(function () {
+      var customMs = (performance.now() - renderStart).toFixed(1);
+      document.getElementById("perfBadge").textContent =
+        Object.keys(tree.byId).length - 1 + " resources discovered · " + data.nodes.length + " nodes rendered · " + customMs + "ms";
+      console.log("[g6_explorer] G6 render (" + vizType + "): " + customMs + "ms for " + data.nodes.length + " nodes / " + data.edges.length + " edges");
+      afterLayoutSettled();
+    });
+    return;
+  }
+
+  graph.setData(data);
+  graph.render().then(function () {
+    var renderMs = (performance.now() - renderStart).toFixed(1);
+    document.getElementById("perfBadge").textContent =
+      Object.keys(tree.byId).length - 1 + " resources discovered · " + data.nodes.length + " nodes rendered · " + renderMs + "ms";
+    console.log("[g6_explorer] G6 render (" + vizType + "): " + renderMs + "ms for " + data.nodes.length + " nodes / " + data.edges.length + " edges");
+    // Every structural change (expand/collapse, search/filter, new dataset) re-compacts wide
+    // ranks and re-fits/re-centers the view so the hierarchy never spreads edge-to-edge.
+    afterLayoutSettled();
+  });
+}
+
+function toggleExpand(nodeId) {
+  if (expandedIds.has(nodeId)) expandedIds.delete(nodeId); else expandedIds.add(nodeId);
+  // From the first expand/collapse click onward, stop re-running the automatic layout on every
+  // interaction: expanding a group should only fan its own new children out around its own
+  // position (see placeNewNodesAround/rerender), never recompute or recenter the whole graph.
+  // The automatic layout still runs once up front (the initial render) and again any time the
+  // user picks a different visualization or clicks Reset Layout (see applyLayout).
+  hasManualLayout = true;
+  rerender();
+}
+
+// --- Hierarchical/Tree compaction ---------------------------------------------------------------
+// antv-dagre/dendrogram lay every same-rank sibling out in a single row - with 40-60+ Resource
+// Groups under one Subscription, that row becomes thousands of pixels wide, and fitView then has
+// to shrink the whole graph down to an unreadable sliver to make it fit. Wrapping each wide rank
+// into a compact grid (same rows-of-siblings concept, just multiple rows instead of one) keeps the
+// hierarchy recognizable while staying centered and readable at 800-1000+ resource scale.
+//
+// Hierarchical flows left-to-right (rank axis = x, siblings spread along y); Tree flows top-down
+// (rank axis = y, siblings spread along x). Both are handled by the same function, generalized
+// over which axis is which, so the two visualizations can use opposite orientations and still
+// each get their own wide-rank compaction.
+var RANK_WRAP_MIN_COUNT = 9;
+function compactifyWideRanks() {
+  var nodeData;
+  try { nodeData = graph.getNodeData(); } catch (e) { return; }
+  var isLR = vizType === "hierarchical";
+  var rankAxis = isLR ? "x" : "y";
+  var spreadAxis = isLR ? "y" : "x";
+  var byRank = {};
+  nodeData.forEach(function (n) {
+    if (!n.style || typeof n.style.x !== "number" || typeof n.style.y !== "number") return;
+    var rankKey = Math.round(n.style[rankAxis] / 10) * 10;
+    (byRank[rankKey] || (byRank[rankKey] = [])).push(n);
+  });
+  // Process ranks in flow order, cascading a running shift forward along the rank axis: a
+  // wrapped rank's *first* row stays exactly where dagre/dendrogram put that rank (so it never
+  // renders before/above its own parent), and every rank deeper than it gets pushed forward by
+  // whatever extra space its wrapped rows added - otherwise a wrapped rank would overlap the
+  // next level.
+  var rankKeys = Object.keys(byRank).map(Number).sort(function (a, b) { return a - b; });
+  var updates = [];
+  var shiftForward = 0;
+  // How far apart each wrapped row is along the rank axis - roughly one more node's worth of
+  // depth per wrap. Larger for LR (rank axis = x, node widths ~180-230px) than TB (rank axis = y,
+  // node heights ~44-54px).
+  var stepSize = isLR ? 260 : 108;
+  function recordUpdate(n, rankAxisVal, spreadAxisVal) {
+    var style = {};
+    style[rankAxis] = rankAxisVal;
+    style[spreadAxis] = spreadAxisVal;
+    updates.push({ id: n.id, style: style });
+  }
+  rankKeys.forEach(function (rankKey) {
+    var rank = byRank[rankKey];
+    // Group this rank's nodes by their parent before wrapping - a rank commonly holds children
+    // from several different parents at once (e.g. every expanded Resource Group's Types all
+    // land on the same "Type" rank). Each parent's own children get their own local grid (so one
+    // parent's set never scatters into a grid shared with an unrelated parent's children), and
+    // those per-parent grids are then laid out one after another along the spread axis - not
+    // anchored back to their original (possibly tightly-packed) position - so two groups can
+    // never end up overlapping regardless of how close together dagre/dendrogram originally put
+    // their parents.
+    var byParent = {};
+    var parentOrder = [];
+    rank.forEach(function (n) {
+      var parentId = tree.parentOf[n.id] || "__root__";
+      if (!byParent[parentId]) { byParent[parentId] = []; parentOrder.push(parentId); }
+      byParent[parentId].push(n);
+    });
+    parentOrder.sort(function (a, b) { return byParent[a][0].style[spreadAxis] - byParent[b][0].style[spreadAxis]; });
+
+    var groupPlans = parentOrder.map(function (parentId) {
+      var group = byParent[parentId];
+      group.sort(function (a, b) { return a.style[spreadAxis] - b.style[spreadAxis]; });
+      // Spacing along the spread axis: the node's own extent in that direction, plus (for LR
+      // only) room for the label placed to the node's right - which visually extends into the
+      // spread (vertical) axis, not the rank axis - so siblings don't collide with each other's
+      // labels.
+      var avgExtent = group.reduce(function (sum, n) {
+        var size = n.style.size;
+        var dim = Array.isArray(size) ? (isLR ? size[1] : size[0]) : size;
+        return sum + (dim || 200);
+      }, 0) / group.length;
+      var laneWidth = avgExtent + (isLR ? 40 : 36);
+      var lanes = group.length < RANK_WRAP_MIN_COUNT ? group.length : Math.max(1, Math.ceil(Math.sqrt(group.length * 1.8)));
+      var wraps = Math.ceil(group.length / lanes);
+      return { group: group, lanes: lanes, laneWidth: laneWidth, wraps: wraps, width: lanes * laneWidth };
+    });
+    var maxWrapsInRank = groupPlans.reduce(function (m, p) { return Math.max(m, p.wraps); }, 1);
+
+    // Lay every parent's grid out consecutively (in original relative order, with a margin
+    // between groups), then re-center the whole row on the rank's original overall centroid so
+    // it doesn't drift arbitrarily far from where dagre/dendrogram originally placed it.
+    var groupMargin = 60;
+    var totalWidth = groupPlans.reduce(function (sum, p) { return sum + p.width; }, 0) + groupMargin * Math.max(0, groupPlans.length - 1);
+    var originalCenter = (rank[0].style[spreadAxis] + rank[rank.length - 1].style[spreadAxis]) / 2;
+    var cursor = originalCenter - totalWidth / 2;
+    var baseCoord = rank[0].style[rankAxis] + shiftForward;
+    groupPlans.forEach(function (plan) {
+      plan.group.forEach(function (n, i) {
+        var lane = i % plan.lanes;
+        var wrap = Math.floor(i / plan.lanes);
+        recordUpdate(n, baseCoord + wrap * stepSize, cursor + lane * plan.laneWidth + plan.laneWidth / 2);
+      });
+      cursor += plan.width + groupMargin;
+    });
+    shiftForward += (maxWrapsInRank - 1) * stepSize;
+  });
+  if (!updates.length) return false;
+  graph.updateNodeData(updates);
+  return true;
+}
+
+// Runs after every render/layout pass regardless of which visualization is active - re-flows
+// wide hierarchical/tree ranks into a compact grid, then always fits+centers the view.
+// graph.draw() is only invoked when compaction actually repositioned nodes: render() already
+// draws once, and an extra unconditional draw() was observed to corrupt network/radial's own
+// freshly-computed positions (they don't need or expect a second draw pass).
+function afterLayoutSettled() {
+  var didCompact = (vizType === "hierarchical" || vizType === "tree") && compactifyWideRanks();
+  var doFitView = function () {
+    syncNodePositions();
+    graph.fitView({ padding: 40, duration: graph.getNodeData().length > 250 ? 0 : 200 });
+  };
+  if (didCompact) {
+    var maybePromise = graph.draw();
+    if (maybePromise && typeof maybePromise.then === "function") maybePromise.then(doFitView);
+    else doFitView();
+  } else {
+    doFitView();
+  }
+}
+
+function ensureGraph(container) {
+  if (graph) return graph;
+  graph = new G6.Graph({
+    container: container,
+    autoResize: true,
+    animation: false,
+    data: { nodes: [], edges: [] },
+    // No graph-level `node: {type: ...}` default - each node already sets its own `type`
+    // ("rect" for Hierarchical/Tree/Radial's group-chrome nodes, "circle" for Network's uniform
+    // nodes, see computeVisibleG6Data) and a static default here was observed to silently win
+    // over that per-node value at render time (every node painted as the default shape
+    // regardless of its own `type`), which is what made Network's circles never actually render.
+    layout: LAYOUT_PRESETS[vizType] || LAYOUT_PRESETS.hierarchical,
+    behaviors: ["zoom-canvas", "drag-canvas", "drag-element"],
+    plugins: [
+      { type: "tooltip", key: "resourceTooltip", itemTypes: ["node"], enterable: false, getContent: buildTooltipContent },
+      // Click (not hover) card - only resource nodes return content (see
+      // buildResourceClickCardContent), so clicking a Resource Group/Type just expands/collapses
+      // as before with no card shown.
+      { type: "tooltip", key: "resourceClickCard", itemTypes: ["node"], trigger: "click", enterable: false, getContent: buildResourceClickCardContent }
+    ],
+    zoomRange: [0.03, 3]
+  });
+  graph.on("node:click", function (evt) {
+    var id = evt.target && evt.target.id;
+    if (!id) return;
+    var node = tree.byId[id];
+    if (!node) return;
+    if (node.kind === "resource") {
+      setComponentValue(id);
+    } else {
+      toggleExpand(id);
+    }
+  });
+  // Clicking empty canvas clears the current selection/highlight - same "__refresh__"-style
+  // sentinel trick infrastructure_explorer.py already handles below, so it's distinguishable
+  // from a Streamlit component's default "nothing clicked yet" return value of null/undefined.
+  graph.on("canvas:click", function () {
+    if (selectedId) setComponentValue("__deselect__");
+  });
+  // Manual repositioning: once the user drops a node somewhere, remember that exact spot and stop
+  // auto-relayouting (see hasManualLayout in rerender()) so the arrangement sticks.
+  graph.on("node:dragend", function (evt) {
+    var id = evt.target && evt.target.id;
+    if (!id) return;
+    try {
+      var pos = graph.getElementPosition(id);
+      if (!pos) return;
+      nodePositions[id] = { x: pos[0], y: pos[1] };
+      hasManualLayout = true;
+    } catch (e) { /* element not resolvable (mid-transition) - ignore, drag simply didn't stick */ }
+  });
+  return graph;
+}
+
+// Re-runs layout only (no data re-fetch, no data rebuild) - all four visualizations share the
+// exact same already-loaded resource tree/subset.
+function applyLayout(vizKey) {
+  if (VIZ_KEYS.indexOf(vizKey) === -1) vizKey = "hierarchical";
+  vizType = vizKey;
+  saveVizPreference(vizKey);
+  // Manual positions only apply "while the current visualization remains active" - switching to
+  // a different layout paradigm should go back to that layout's own automatic arrangement.
+  hasManualLayout = false;
+  nodePositions = {};
+  var sel = document.getElementById("vizType");
+  if (sel.value !== vizKey) sel.value = vizKey;
+  if (!graph) return;
+  // Rebuild the graph instance rather than reusing setData()/render() on the existing one:
+  // switching a node's shape `type` (rect <-> circle - i.e. any transition into or out of
+  // Network) on an already-rendered G6 v5 graph was observed to leave stale rendering artifacts
+  // from the old shape (old dashed-rect chrome still showing at the new layout's positions, or a
+  // blank canvas) instead of properly repainting as the new shape. A fresh instance side-steps
+  // that entirely. This never touches `tree`/Azure data, only the rendering-layer graph object.
+  var container = document.getElementById("g6Container");
+  graph.destroy();
+  graph = null;
+  ensureGraph(container);
+  // Same readability cap rerender() applies: switching into Network/Radial from a fully-expanded
+  // Hierarchical/Tree view must not dump every expanded node into a force/radial layout - that's
+  // exactly the dense spider-web/overlap this cap exists to prevent.
+  var matches = computeMatches();
+  enforceReadabilityCap(matches);
+  var data = computeVisibleG6Data(matches);
+  var renderStart = performance.now();
+  if (vizKey === "radial" || vizKey === "network") {
+    if (vizKey === "radial") applyRadialPositions(data); else applyNetworkPositions(data);
+    graph.setData(data);
+    Promise.resolve(graph.draw()).then(function () {
+      console.log("[g6_explorer] G6 render (" + vizKey + "): " + (performance.now() - renderStart).toFixed(1) + "ms, " + data.nodes.length + " nodes");
+      afterLayoutSettled();
+    });
+    return;
+  }
+  // graph.setLayout() only swaps the layout config synchronously (no Promise returned here,
+  // unlike graph.render()) - re-running render() is what actually re-computes positions and
+  // draws, using the exact same already-bound data. Node shape (rect vs circle) and edge type
+  // depend on vizType too, so rebuild the data set, not just the layout.
+  graph.setLayout(LAYOUT_PRESETS[vizKey]);
+  graph.setData(data);
+  graph.render().then(function () {
+    console.log("[g6_explorer] G6 render (" + vizType + "): " + (performance.now() - renderStart).toFixed(1) + "ms, " + data.nodes.length + " nodes");
+    afterLayoutSettled();
+  });
+}
+
+// --- Toolbar wiring -------------------------------------------------------------------------
+// Debounced: on a large expanded tree, rerender() can trigger a full relayout (dagre/dendrogram
+// over hundreds of nodes) which blocks the main thread long enough to make typing itself feel
+// unresponsive if it ran on every single keystroke. Waiting for a short pause in typing keeps the
+// input itself always instant (that part is native browser behavior, unrelated to this handler)
+// while still updating the graph promptly once the user stops typing.
+var searchDebounceTimer = null;
+document.getElementById("search").addEventListener("input", function (e) {
+  var value = e.target.value;
+  if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(function () { search = value; rerender(); }, 220);
+});
+document.getElementById("filterType").addEventListener("change", function (e) { typeFilter = e.target.value; rerender(); });
+document.getElementById("filterHealth").addEventListener("change", function (e) { healthFilter = e.target.value; rerender(); });
+document.getElementById("vizType").addEventListener("change", function (e) { applyLayout(e.target.value); });
+document.getElementById("expandAll").addEventListener("click", function () {
+  Object.keys(tree.byId).forEach(function (id) { if (tree.byId[id].kind !== "resource") expandedIds.add(id); });
+  rerender();
+});
+document.getElementById("collapseAll").addEventListener("click", function () {
+  expandedIds.clear();
+  expandedIds.add(SUBSCRIPTION_ID);
+  rerender();
+});
+document.getElementById("fitView").addEventListener("click", function () {
+  if (graph) graph.fitView({ padding: 40 });
+});
+document.getElementById("fullscreenBtn").addEventListener("click", function () {
+  // The whole #root (toolbar + canvas) goes fullscreen, not just the canvas, so search, filters,
+  // the viz selector, zoom, Page Fit, and Reset Layout all stay reachable while fullscreen.
+  var el = document.getElementById("root");
+  if (!document.fullscreenElement) { if (el.requestFullscreen) el.requestFullscreen(); }
+  else if (document.exitFullscreen) document.exitFullscreen();
+});
+// Entering/exiting fullscreen changes the container's actual pixel size; autoResize picks that up,
+// but the graph's existing zoom/pan is now wrong for the new size, so recompute and re-fit.
+document.addEventListener("fullscreenchange", function () {
+  if (!graph) return;
+  setTimeout(function () {
+    if (graph.resize) graph.resize();
+    graph.fitView({ padding: 40, duration: 150 });
+  }, 120);
+});
+document.getElementById("zoomIn").addEventListener("click", function () {
+  if (graph) graph.zoomBy(1.25);
+});
+document.getElementById("zoomOut").addEventListener("click", function () {
+  if (graph) graph.zoomBy(0.8);
+});
+document.getElementById("pageFitBtn").addEventListener("click", function () {
+  if (!graph) return;
+  // Distinct from Fit View: also forces a size recompute first, which is what's actually needed
+  // right after toggling Full Screen (the canvas's pixel dimensions just changed).
+  if (graph.resize) graph.resize();
+  graph.fitView({ padding: 40 });
+});
+document.getElementById("resetLayoutBtn").addEventListener("click", function () {
+  applyLayout(vizType); // clears manual positions (see applyLayout) and reruns the automatic layout
+});
+// A Streamlit custom component's reported value is sticky - it keeps returning the same value on
+// every rerun until JS sends a new one. A fixed "__refresh__" string would make the Python side
+// see the *same* refresh request forever and re-issue it on every single rerun (an infinite
+// refetch loop - this is exactly what made Refresh look broken/slow). Appending a timestamp makes
+// each click's value unique so Python can tell "a new click happened" from "still reporting the
+// last one" and only act once per actual click.
+document.getElementById("refreshBtn").addEventListener("click", function () { setComponentValue("__refresh__:" + Date.now()); });
+
+function refreshTypeFilterOptions(resources) {
+  var sel = document.getElementById("filterType");
+  var seen = {}; var out = [];
+  resources.forEach(function (r) {
+    var meta = typeMeta(r.type);
+    if (!seen[meta.key]) { seen[meta.key] = true; out.push(meta); }
+  });
+  out.sort(function (a, b) { return a.name.localeCompare(b.name); });
+  var current = sel.value;
+  sel.innerHTML = "";
+  var allOpt = document.createElement("option"); allOpt.value = ""; allOpt.textContent = "All Types"; sel.appendChild(allOpt);
+  out.forEach(function (t) {
+    var opt = document.createElement("option");
+    opt.value = t.key; opt.textContent = t.icon + " " + t.name;
+    sel.appendChild(opt);
+  });
+  sel.value = current && seen[current] ? current : "";
+}
+
+// --- Mount + Streamlit wiring --------------------------------------------------------------------
+var lastResetToken = 0;
+function render(args) {
+  var resources = args.resources || [];
+  var subscriptionLabel = args.subscription_label || "Subscription";
+  var height = args.height || 760;
+  var incomingSelectedId = args.selected_id || null;
+  var resetToken = args.reset_token || 0;
+
+  var container = document.getElementById("g6Container");
+  var containerHeight = Math.max(height - 70, 400);
+  container.style.height = containerHeight + "px";
+
+  ensureGraph(container);
+
+  var resourcesKey = resources.length + ":" + (resources[0] ? (resources[0].id || resources[0].resource_id) : "");
+  var isNewDataset = resourcesKey !== lastResourcesKey;
+  // The Refresh button bumps reset_token even when the re-fetched data is identical (same
+  // length/first id, so isNewDataset alone wouldn't catch it) - Refresh is supposed to also
+  // undo the user's expand/drag exploration and return to the pristine initial view, not just
+  // silently re-fetch underneath whatever they'd expanded/dragged.
+  var forcedReset = resetToken !== lastResetToken;
+  lastResetToken = resetToken;
+
+  if (isNewDataset || forcedReset) {
+    var transformStart = performance.now();
+    tree = buildTree(resources, subscriptionLabel);
+    console.log("[g6_explorer] data transformation (buildTree): " + (performance.now() - transformStart).toFixed(1) + "ms for " + resources.length + " resources");
+    expandedIds = new Set([SUBSCRIPTION_ID]);
+    // A fresh dataset invalidates any manual arrangement from the previous one.
+    hasManualLayout = false;
+    nodePositions = {};
+    // Small subscriptions get the friendlier "RGs pre-expanded" overview; large ones (the
+    // 800-1000 resource case) start collapsed to just the subscription root so the first paint
+    // is a compact, meaningful overview instead of hundreds of nodes at once.
+    if (resources.length <= LARGE_DATASET_THRESHOLD) {
+      tree.byId[SUBSCRIPTION_ID].childIds.forEach(function (rgId) { expandedIds.add(rgId); });
+    }
+    refreshTypeFilterOptions(resources);
+    lastResourcesKey = resourcesKey;
+  }
+
+  selectedId = incomingSelectedId;
+  if (selectedId !== lastSelectedIdArg) {
+    lastSelectedIdArg = selectedId;
+    if (selectedId && tree.byId[selectedId]) expandAncestorsOf(selectedId);
+  }
+
+  rerender();
+
+  setFrameHeight(height);
+}
+
+document.getElementById("vizType").value = vizType;
+onRender(render);
+initStreamlit();
+setFrameHeight(760);
+</script>
+</body>
+</html>
