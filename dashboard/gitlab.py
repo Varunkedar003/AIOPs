@@ -1,6 +1,8 @@
 import streamlit as st
 from typing import Any, Dict, List, Optional
 
+from synthesis.claude_synthesizer import ClaudeSynthesizer
+
 
 def _status_color(status: str) -> str:
     status_lower = (status or "").lower()
@@ -25,7 +27,25 @@ def render_project_selector(resource_service: Any, preselect_hint: Optional[str]
         st.info("No GitLab projects available. Check GITLAB_URL / GITLAB_TOKEN in Settings.")
         return None
 
-    options = {project["name"]: project for project in projects}
+    search_query = st.text_input(
+        "Search projects", value="", placeholder="Filter by name or path...", key="gitlab_project_search"
+    ).strip().lower()
+
+    # Filters the already-fetched (and provider-cached) project list in memory - never
+    # re-fetches from GitLab, so typing in the search box can't trigger repeated API calls.
+    filtered_projects = (
+        [
+            project for project in projects
+            if search_query in (project.get("name") or "").lower()
+            or search_query in (project.get("path") or "").lower()
+        ]
+        if search_query else projects
+    )
+    if not filtered_projects:
+        st.info(f"No projects match '{search_query}'.")
+        return None
+
+    options = {project["name"]: project for project in filtered_projects}
     names = list(options.keys())
 
     default_index = 0
@@ -38,7 +58,7 @@ def render_project_selector(resource_service: Any, preselect_hint: Optional[str]
                 matched_name = name
                 break
 
-    selected_name = st.selectbox("Project", options=names, index=default_index)
+    selected_name = st.selectbox("Project", options=names, index=default_index, key="gitlab_project_selector")
     if matched_name and selected_name == matched_name:
         st.caption(f"Auto-selected based on the selected resource (**{preselect_hint}**).")
     return options[selected_name]
@@ -88,6 +108,57 @@ def render_branches_tab(resource_service: Any, project_id: str) -> None:
         for branch in branches
     ]
     st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def render_commits_tab(resource_service: Any, project_id: str) -> None:
+    commits = resource_service.get_project_recent_commits(project_id)
+    if not commits:
+        st.info("No commit data available.")
+        return
+
+    rows = [
+        {
+            "SHA": commit.get("short_id") or (commit.get("commit_id") or "")[:8],
+            "Author": commit.get("author_name") or "Unknown author",
+            "Message": commit.get("title") or commit.get("message") or "",
+            "Date": commit.get("committed_date") or commit.get("authored_date"),
+        }
+        for commit in commits
+    ]
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    st.markdown("##### Investigate a Commit")
+    options = {
+        f"{(c.get('short_id') or (c.get('commit_id') or '')[:8])} — {c.get('title') or c.get('message') or ''}": c
+        for c in commits
+    }
+    selected_key = st.selectbox("Select a commit", options=list(options.keys()), key=f"gitlab_commit_select_{project_id}")
+    selected_commit = options[selected_key]
+
+    if selected_commit.get("web_url"):
+        st.markdown(f"[Open commit in GitLab]({selected_commit['web_url']})")
+
+    diff = resource_service.get_commit_diff(project_id, selected_commit["commit_id"])
+    if not diff:
+        st.info("No changed files for this commit.")
+        return
+
+    st.caption(f"{len(diff)} file(s) changed in this commit:")
+    diff_rows = [
+        {
+            "File": d.get("new_path") or d.get("old_path"),
+            "New": "Yes" if d.get("new_file") else "",
+            "Deleted": "Yes" if d.get("deleted_file") else "",
+            "Renamed": "Yes" if d.get("renamed_file") else "",
+        }
+        for d in diff
+    ]
+    st.dataframe(diff_rows, use_container_width=True, hide_index=True)
+    for d in diff:
+        file_label = d.get("new_path") or d.get("old_path")
+        if d.get("diff"):
+            with st.expander(f"Diff: {file_label}"):
+                st.code(d["diff"], language="diff")
 
 
 def render_pipelines_tab(resource_service: Any, project_id: str) -> List[Dict[str, Any]]:
@@ -157,6 +228,27 @@ def render_pipeline_detail(resource_service: Any, project_id: str, pipelines: Li
         for job in jobs
     ]
     st.dataframe(job_rows, use_container_width=True, hide_index=True)
+
+
+def render_merge_requests_tab(resource_service: Any, project_id: str) -> None:
+    merge_requests = resource_service.get_project_merge_requests(project_id)
+    if not merge_requests:
+        st.info("No open merge requests.")
+        return
+
+    rows = [
+        {
+            "IID": f"!{mr.get('id')}",
+            "Title": mr.get("title"),
+            "Author": mr.get("author") or "Unknown",
+            "State": mr.get("state"),
+            "Source Branch": mr.get("source_branch"),
+            "Target Branch": mr.get("target_branch"),
+            "Created": mr.get("created_at"),
+        }
+        for mr in merge_requests
+    ]
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
 def render_investigation_tab(resource_service: Any, project_id: str) -> None:
@@ -260,3 +352,105 @@ def render_investigation_tab(resource_service: Any, project_id: str) -> None:
             for a in artifacts
         ]
         st.dataframe(artifact_rows, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    render_advanced_rca(resource_service, project_id, report)
+
+
+def _get_claude_synthesizer() -> ClaudeSynthesizer:
+    """Reuses the same ClaudeSynthesizer the chatbot's synthesis stage uses (see
+    synthesis/claude_synthesizer.py / workflow/graph.py's NODE_COMPLETE) - cached in
+    session_state so this page doesn't construct a new Anthropic client on every rerun."""
+    if "gitlab_claude_synthesizer" not in st.session_state:
+        st.session_state["gitlab_claude_synthesizer"] = ClaudeSynthesizer()
+    return st.session_state["gitlab_claude_synthesizer"]
+
+
+def render_advanced_rca(resource_service: Any, project_id: str, basic_report: Dict[str, Any]) -> None:
+    """Advanced AI root cause analysis for the failed pipeline identified above.
+
+    Combines three existing, already-implemented evidence sources - the basic
+    failure/comparison report (`investigate_pipeline_failure`), the deep pipeline evidence
+    (`investigate_pipeline`: failure point, error message, stack trace, artifacts, same-job
+    comparison - Task 15), and the deep git-change evidence (`investigate_git_changes`:
+    triggering/previous-successful commit, diff, linked MR with approvals/comments - Task 16)
+    - then feeds all of it, unmodified, into the same Claude Sonnet synthesis stage the
+    chatbot uses. No evidence is invented here; Claude only ever sees facts already collected
+    by the existing GitLab client methods, and is instructed (see its system prompt) to say so
+    explicitly when the evidence doesn't support a confident conclusion.
+    """
+    failed_pipeline = (basic_report or {}).get("failed_pipeline") or {}
+    if not failed_pipeline:
+        return
+
+    pipeline_id = failed_pipeline.get("id")
+    st.markdown("##### Advanced Root Cause Analysis (AI)")
+    st.caption(
+        "Combines deep pipeline evidence (failure point, error message, stack trace, artifacts), "
+        "git-change evidence (commit diff, linked MR with approvals/comments), and the failure "
+        "summary above, then asks Claude Sonnet to correlate them into one root cause and "
+        "resolution plan - grounded only in the evidence collected."
+    )
+
+    state_key = f"gitlab_advanced_rca_{project_id}_{pipeline_id}"
+    if st.button("Run Advanced AI Root Cause Analysis", key=f"gitlab_rca_btn_{project_id}_{pipeline_id}"):
+        with st.spinner("Gathering deep pipeline/git evidence and running Claude synthesis..."):
+            pipeline_investigation = resource_service.investigate_pipeline(project_id, pipeline_id)
+            git_changes = resource_service.investigate_git_changes(project_id, pipeline_id)
+            synthesizer = _get_claude_synthesizer()
+            outcome = synthesizer.synthesize(
+                domain_reports={},
+                evidence={
+                    "pipeline_failure_summary": basic_report,
+                    "pipeline_investigation": pipeline_investigation,
+                    "git_changes": git_changes,
+                },
+                query=f"Perform root cause analysis on the failed pipeline #{pipeline_id} for this project.",
+                resource_id=project_id,
+            )
+            st.session_state[state_key] = {
+                "outcome": outcome,
+                "pipeline_investigation": pipeline_investigation,
+                "git_changes": git_changes,
+                "error": synthesizer.last_error,
+            }
+
+    result = st.session_state.get(state_key)
+    if not result:
+        st.info("Click **Run Advanced AI Root Cause Analysis** to correlate the deep evidence above into a root cause.")
+        return
+
+    pipeline_investigation = result["pipeline_investigation"]
+    git_changes = result["git_changes"]
+
+    st.markdown("###### Affected (from collected evidence)")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        failed_job = pipeline_investigation.get("failed_job") or {}
+        st.markdown("**Job**")
+        job_label = failed_job.get("name") or "Unknown"
+        if failed_job.get("stage"):
+            job_label += f" (stage: {failed_job['stage']})"
+        st.markdown(f"`{job_label}`")
+    with col2:
+        commit = git_changes.get("triggering_commit") or {}
+        st.markdown("**Commit**")
+        st.markdown(f"`{commit.get('short_id') or 'Unknown'}` {commit.get('title') or ''}")
+    with col3:
+        mr = git_changes.get("merge_request")
+        st.markdown("**Merge Request**")
+        st.markdown(f"!{mr.get('id')} {mr.get('title')}" if mr else "None linked")
+
+    if pipeline_investigation.get("error_message"):
+        st.markdown("###### Error Message")
+        st.code(pipeline_investigation["error_message"], language="text")
+    if pipeline_investigation.get("stack_trace"):
+        with st.expander("Stack Trace"):
+            st.code(pipeline_investigation["stack_trace"], language="text")
+
+    outcome = result["outcome"]
+    if result.get("error"):
+        st.error(f"Claude synthesis failed: {result['error']}")
+
+    st.markdown("---")
+    st.markdown(outcome["markdown"])

@@ -698,8 +698,10 @@ class ResourceService:
         return self.gitlab_provider.get_latest_commit(project_id)
 
     def get_commit_diff(self, project_id: str, sha: str) -> List[Dict[str, Any]]:
-        """Get the changed-files diff for a single commit."""
-        return self.gitlab_provider.get_commit_diff(project_id, sha)
+        """Get the changed-files diff for a single commit (cached per project+commit per
+        session - the Commits tab re-renders on every unrelated widget interaction while a
+        commit stays selected for investigation)."""
+        return self._cached(project_id, f"gitlab_commit_diff:{sha}", lambda: self.gitlab_provider.get_commit_diff(project_id, sha))
 
     def get_pipeline_artifacts(self, project_id: str, pipeline_id: str) -> List[Dict[str, Any]]:
         """Get artifact metadata for every job in a pipeline."""
@@ -713,9 +715,24 @@ class ResourceService:
         """Build a structured investigation report comparing the latest failed pipeline to the last successful one."""
         return self.gitlab_provider.investigate_pipeline_failure(project_id, pipeline_id)
 
+    def investigate_pipeline(self, project_id: str, pipeline_id: Optional[str] = None) -> Dict[str, Any]:
+        """Deep, live evidence for a failed pipeline: failure point, error message, stack
+        trace, artifacts, and a same-job comparison with the last successful pipeline
+        (Task 15 - facts only, no root cause). Not cached: only ever triggered by an explicit
+        "Run Advanced RCA" click, never on a page rerun."""
+        return self.gitlab_provider.investigate_pipeline(project_id, pipeline_id)
+
+    def investigate_git_changes(self, project_id: str, pipeline_id: Optional[str] = None) -> Dict[str, Any]:
+        """Live Git change evidence for a pipeline: triggering commit, previous successful
+        commit, diff, and the linked merge request's full detail - approvals, comments,
+        reviewers (Task 16 - facts only, no root cause). Not cached, for the same reason as
+        investigate_pipeline() above."""
+        return self.gitlab_provider.investigate_git_changes(project_id, pipeline_id)
+
     def get_project_merge_requests(self, project_id: str) -> List[Dict[str, Any]]:
-        """Get open merge requests for a GitLab project."""
-        return self.gitlab_provider.get_merge_requests(project_id)
+        """Get open merge requests for a GitLab project (cached per project per session - the
+        MR tab re-renders on every unrelated widget interaction on the GitLab Workspace page)."""
+        return self._cached(project_id, "gitlab_merge_requests", lambda: self.gitlab_provider.get_merge_requests(project_id))
 
     def get_repository_profile(self, project_id: str, ref: Optional[str] = None) -> Dict[str, Any]:
         """One-shot repository structure profile: tech stack, README, CI config, Dockerfile(s),
@@ -727,8 +744,13 @@ class ResourceService:
         return self.gitlab_provider.get_environments(project_id)
 
     def get_project_recent_commits(self, project_id: str, ref: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
-        """Get the most recent commits on a GitLab project's branch."""
-        return self.gitlab_provider.get_recent_commits(project_id, ref=ref, limit=limit)
+        """Get the most recent commits on a GitLab project's branch (cached per project per
+        session, keyed by ref/limit - the Commits tab re-renders on every unrelated widget
+        interaction on the GitLab Workspace page, e.g. picking a commit to investigate)."""
+        return self._cached(
+            project_id, f"gitlab_recent_commits:{ref}:{limit}",
+            lambda: self.gitlab_provider.get_recent_commits(project_id, ref=ref, limit=limit),
+        )
 
     def get_all_azure_resources_raw(self) -> List[Dict[str, Any]]:
         """Get every Azure resource in the subscription, unfiltered, straight from Resource
