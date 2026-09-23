@@ -79,7 +79,11 @@ class AzureResourceGraph:
                 pages += 1
                 request = QueryRequest(
                     query=query,
-                    subscriptions=[self.azure_auth.subscription_id],
+                    # Resource Graph is natively cross-subscription - passing every
+                    # configured subscription here queries all of them in one call, no
+                    # extra round trips needed (unlike aks.py/cost_management.py, whose
+                    # underlying SDK clients only ever bind to one subscription each).
+                    subscriptions=self.azure_auth.subscription_ids or [self.azure_auth.subscription_id],
                     options=QueryRequestOptions(top=_PAGE_SIZE, skip_token=skip_token),
                 )
                 response = client.resources(request)

@@ -34,11 +34,30 @@ class Config:
     ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
     
     # Azure
-    AZURE_SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID", "")
+    # AZURE_SUBSCRIPTION_IDS: comma-separated list, for querying across multiple
+    # subscriptions (e.g. Production + Dev&Stage) with one shared Service Principal.
+    # AZURE_SUBSCRIPTION_ID is kept for backward compatibility (single-subscription
+    # .env files, and any SDK client that only ever binds to one subscription at
+    # construction time) - it's derived as the first entry of the list below.
+    AZURE_SUBSCRIPTION_IDS = [
+        s.strip() for s in os.getenv("AZURE_SUBSCRIPTION_IDS", "").split(",") if s.strip()
+    ] or ([os.getenv("AZURE_SUBSCRIPTION_ID", "")] if os.getenv("AZURE_SUBSCRIPTION_ID") else [])
+    AZURE_SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID", "") or (
+        AZURE_SUBSCRIPTION_IDS[0] if AZURE_SUBSCRIPTION_IDS else ""
+    )
     AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID", "")
     AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "")
     AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET", "")
     AZURE_RESOURCE_GROUP = os.getenv("AZURE_RESOURCE_GROUP", "")
+
+    # Staging and Production are different Service Principals (not one shared SP across
+    # both) - each subscription's own credentials, used by the subscription picker
+    # (dashboard/subscription_picker.py) to build the right AzureAuth per selection.
+    # AZURE_TENANT_ID above is shared by both (same AAD tenant, "KLYP Directory").
+    AZURE_CLIENT_ID_STAGING = os.getenv("AZURE_CLIENT_ID_STAGING", "")
+    AZURE_CLIENT_SECRET_STAGING = os.getenv("AZURE_CLIENT_SECRET_STAGING", "")
+    AZURE_CLIENT_ID_PRODUCTION = os.getenv("AZURE_CLIENT_ID_PRODUCTION", "")
+    AZURE_CLIENT_SECRET_PRODUCTION = os.getenv("AZURE_CLIENT_SECRET_PRODUCTION", "")
     
     # AKS
     AKS_CLUSTER_NAME = os.getenv("AKS_CLUSTER_NAME", "")

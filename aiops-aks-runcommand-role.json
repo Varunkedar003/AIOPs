@@ -1,0 +1,17 @@
+{
+  "Name": "AIOps AKS Run Command Reader",
+  "IsCustom": true,
+  "Description": "Allows AIOps Commander to read AKS metadata and use the existing AKS Run Command capability.",
+  "Actions": [
+    "Microsoft.ContainerService/managedClusters/read",
+    "Microsoft.ContainerService/managedClusters/runcommand/action",
+    "Microsoft.ContainerService/managedClusters/commandResults/read"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/17187d06-46b6-402b-a569-f0ecd2b5b968",
+    "/subscriptions/fc3917a9-6bd1-49f6-9b62-30d651321528"
+  ]
+}

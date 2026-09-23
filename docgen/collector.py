@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from docgen.discovery import ProjectContext
 from services.resource_service import ResourceService
+from utils.k8s_safety import AKSUnreachableError
 
 _AKS_TYPE = "microsoft.containerservice/managedclusters"
 _APP_SERVICE_TYPE = "microsoft.web/sites"
@@ -191,7 +192,7 @@ class DocumentationCollector:
         namespace = context.aks_namespace
         rs = self.resource_service
 
-        return {
+        base = {
             "agent": "aks_source",
             "found": True,
             "cluster": cluster,
@@ -201,12 +202,27 @@ class DocumentationCollector:
                 else "Namespace could not be confidently identified; data below is cluster-wide."
             ),
             "node_pools": cluster.get("node_pools", []),
-            "deployments": rs.get_cluster_deployments(cluster_id, namespace),
-            "services": rs.get_cluster_services(cluster_id, namespace),
-            "ingress": rs.get_cluster_ingress(cluster_id, namespace),
-            "configmaps": rs.get_cluster_configmaps(cluster_id, namespace),
-            "secrets": rs.get_cluster_secrets(cluster_id, namespace),
         }
+        try:
+            base.update({
+                "deployments": rs.get_cluster_deployments(cluster_id, namespace),
+                "services": rs.get_cluster_services(cluster_id, namespace),
+                "ingress": rs.get_cluster_ingress(cluster_id, namespace),
+                "configmaps": rs.get_cluster_configmaps(cluster_id, namespace),
+                "secrets": rs.get_cluster_secrets(cluster_id, namespace),
+            })
+        except AKSUnreachableError as exc:
+            # Cluster ARM metadata (cluster/node_pools above) always succeeds independently of
+            # the cluster's own Kubernetes API - only the K8s-sourced fields are unavailable, so
+            # the doc still gets an explicit "AKS data unavailable" result instead of no AKS
+            # section (or, absent this catch, an uncaught exception killing the whole run - see
+            # workflow/docgen_graph.py's own AKSUnreachableError guard for the outer safety net).
+            base.update({
+                "unavailable": True,
+                "reason": f"AKS data unavailable: {exc}",
+                "deployments": [], "services": [], "ingress": [], "configmaps": [], "secrets": [],
+            })
+        return base
 
     def _collect_observability(self, context: ProjectContext) -> Dict[str, Any]:
         targets = [r for r in context.azure_resources if (r.get("type") or "").lower() in (_APP_SERVICE_TYPE, _AKS_TYPE)]

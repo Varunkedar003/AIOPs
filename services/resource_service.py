@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -8,12 +8,26 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 from providers import MockAzureProvider, MockAKSProvider, MockGitLabProvider, MockObservabilityProvider, MockCostProvider
+from providers.azure.auth import AzureAuth
+from providers.azure.resource_graph import AzureResourceGraph
+from providers.azure.aks import AzureAKS
+from providers.azure.app_service_logs import AzureAppServiceLogs
+from providers.azure.cost_management import AzureCostManagement
+from providers.azure.monitor import AzureMonitorMetrics
+from providers.azure.alerts import AzureAlerts
+from providers.azure.log_analytics import AzureLogAnalytics
 from providers.azure.relationships import AzureRelationshipDiscovery
 from utils.resource_id import normalize_resource_id
-from utils.k8s_safety import call_with_timeout
+from utils.k8s_safety import AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS, AKSUnreachableError, call_with_timeout
+from utils.aks_diagnostics import detect_namespace_issues
 from utils.timing import log_timing
 
 logger = logging.getLogger(__name__)
+
+# Matches dashboard.aks.run_concurrent_fetches' _WORKSPACE_FETCH_CONCURRENCY - not one thread
+# per fetch, bounded to what's already been observed as AKS Run Command's own effective
+# throughput rather than firing every kind (or every unhealthy pod) at once.
+_NAMESPACE_INVESTIGATION_CONCURRENCY = 3
 
 # ARM resource-type strings (as returned by Azure Resource Graph, case varies) for each sidebar/
 # explorer category. MockAzureProvider's own get_app_services()/get_sql_databases()/etc. are
@@ -81,13 +95,27 @@ _NOISE_ARM_TYPES = {
 class ResourceService:
     """Service layer for resource management operations"""
 
-    def __init__(self):
-        """Initialize resource service with providers"""
-        self.azure_provider = MockAzureProvider()
-        self.aks_provider = MockAKSProvider()
+    def __init__(self, azure_auth: Optional[AzureAuth] = None):
+        """Initialize resource service with providers.
+
+        `azure_auth`: which subscription(s) to query, shared across every Azure-backed
+        provider below - defaults to Config's AZURE_SUBSCRIPTION_IDS (.env) if not given.
+        The subscription picker (dashboard/sidebar.py) passes a single-subscription
+        AzureAuth here when the user switches Staging/Production, rebuilding this whole
+        service so every provider consistently points at the newly-selected subscription
+        instead of some providers still holding onto the old one.
+        """
+        auth = azure_auth or AzureAuth()
+        self.azure_provider = MockAzureProvider(resource_graph=AzureResourceGraph(azure_auth=auth))
+        self.aks_provider = MockAKSProvider(aks=AzureAKS(azure_auth=auth))
         self.gitlab_provider = MockGitLabProvider()
-        self.observability_provider = MockObservabilityProvider()
-        self.cost_provider = MockCostProvider()
+        self.observability_provider = MockObservabilityProvider(
+            monitor_metrics=AzureMonitorMetrics(azure_auth=auth),
+            alerts=AzureAlerts(azure_auth=auth),
+            log_analytics=AzureLogAnalytics(azure_auth=auth),
+        )
+        self.cost_provider = MockCostProvider(cost_management=AzureCostManagement(azure_auth=auth))
+        self.app_service_logs_provider = AzureAppServiceLogs(azure_auth=auth)
         self.relationship_discovery = AzureRelationshipDiscovery()
         self._per_resource_cache: Dict[str, Dict[str, Any]] = {}
         # Memoized get_cost_analysis() results, keyed by (from, to) - see that method's
@@ -255,56 +283,212 @@ class ResourceService:
         return self.aks_provider.get_clusters()
 
     def get_cluster_namespaces(self, cluster_id: str) -> List[Dict[str, Any]]:
-        """Get namespaces for a specific cluster. Raises AKSUnreachableError (see
-        utils/k8s_safety.py) instead of crashing if the cluster's API server can't be reached -
-        e.g. a private cluster off-VNet."""
-        return call_with_timeout(self.aks_provider.get_namespaces, cluster_id)
+        """Get namespaces for a specific cluster (cached per cluster per session - see
+        _cached()). Raises AKSUnreachableError (see utils/k8s_safety.py) instead of crashing if
+        the cluster's API server can't be reached - e.g. a private cluster off-VNet; a failed
+        call is never cached, so the next rerun retries live.
+
+        Bounded by AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS (not the plain 12s default) because
+        providers.azure.aks.AzureAKS may internally fall back from a direct Kubernetes API
+        connection to AKS Run Command for this call - a valid, still-running Run Command
+        invocation must not be cut off by a timeout sized for a direct connection alone."""
+        return self._cached(
+            cluster_id, "aks_namespaces",
+            lambda: call_with_timeout(self.aks_provider.get_namespaces, cluster_id, timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS),
+        )
 
     def get_cluster_nodes(self, cluster_id: str) -> List[Dict[str, Any]]:
-        """Get nodes for a specific cluster"""
-        return call_with_timeout(self.aks_provider.get_nodes, cluster_id)
+        """Get nodes for a specific cluster (cached per cluster per session)"""
+        return self._cached(
+            cluster_id, "aks_nodes",
+            lambda: call_with_timeout(self.aks_provider.get_nodes, cluster_id, timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS),
+        )
 
     def get_cluster_deployments(self, cluster_id: str, namespace: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get deployments for a cluster, optionally filtered to one namespace"""
-        return call_with_timeout(self.aks_provider.get_deployments, cluster_id, namespace)
+        """Get deployments for a cluster, optionally filtered to one namespace (cached per
+        cluster+namespace per session)"""
+        return self._cached(
+            cluster_id, f"aks_deployments:{namespace}",
+            lambda: call_with_timeout(self.aks_provider.get_deployments, cluster_id, namespace, timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS),
+        )
 
     def get_namespace_deployments(self, cluster_id: str, namespace: str) -> List[Dict[str, Any]]:
         """Get deployments for a specific namespace"""
-        return call_with_timeout(self.aks_provider.get_namespace_deployments, cluster_id, namespace)
+        return call_with_timeout(self.aks_provider.get_namespace_deployments, cluster_id, namespace, timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS)
 
     def get_cluster_replicasets(self, cluster_id: str, namespace: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get ReplicaSets for a cluster, optionally filtered to one namespace"""
-        return call_with_timeout(self.aks_provider.get_replicasets, cluster_id, namespace)
+        """Get ReplicaSets for a cluster, optionally filtered to one namespace (cached per
+        cluster+namespace per session)"""
+        return self._cached(
+            cluster_id, f"aks_replicasets:{namespace}",
+            lambda: call_with_timeout(self.aks_provider.get_replicasets, cluster_id, namespace, timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS),
+        )
 
     def get_cluster_pods(self, cluster_id: str, namespace: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get pods for a cluster, optionally filtered to one namespace"""
-        return call_with_timeout(self.aks_provider.get_pods, cluster_id, namespace)
+        """Get pods for a cluster, optionally filtered to one namespace (cached per
+        cluster+namespace per session)"""
+        return self._cached(
+            cluster_id, f"aks_pods:{namespace}",
+            lambda: call_with_timeout(self.aks_provider.get_pods, cluster_id, namespace, timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS),
+        )
 
     def get_namespace_pods(self, cluster_id: str, namespace: str) -> List[Dict[str, Any]]:
         """Get pods for a specific namespace"""
-        return call_with_timeout(self.aks_provider.get_pods, cluster_id, namespace)
+        return call_with_timeout(self.aks_provider.get_pods, cluster_id, namespace, timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS)
 
     def get_cluster_services(self, cluster_id: str, namespace: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get services for a cluster, optionally filtered to one namespace"""
-        return call_with_timeout(self.aks_provider.get_services, cluster_id, namespace)
+        """Get services for a cluster, optionally filtered to one namespace (cached per
+        cluster+namespace per session)"""
+        return self._cached(
+            cluster_id, f"aks_services:{namespace}",
+            lambda: call_with_timeout(self.aks_provider.get_services, cluster_id, namespace, timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS),
+        )
 
     def get_cluster_ingress(self, cluster_id: str, namespace: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get ingress resources for a cluster, optionally filtered to one namespace"""
-        return call_with_timeout(self.aks_provider.get_ingress, cluster_id, namespace)
+        """Get ingress resources for a cluster, optionally filtered to one namespace (cached per
+        cluster+namespace per session)"""
+        return self._cached(
+            cluster_id, f"aks_ingress:{namespace}",
+            lambda: call_with_timeout(self.aks_provider.get_ingress, cluster_id, namespace, timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS),
+        )
 
     def get_cluster_events(self, cluster_id: str, namespace: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get recent events for a cluster, optionally filtered to one namespace"""
-        return call_with_timeout(self.aks_provider.get_events, cluster_id, namespace)
+        """Get recent events for a cluster, optionally filtered to one namespace (cached per
+        cluster+namespace per session)"""
+        return self._cached(
+            cluster_id, f"aks_events:{namespace}",
+            lambda: call_with_timeout(self.aks_provider.get_events, cluster_id, namespace, timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS),
+        )
 
     def get_pod_logs(
         self, cluster_id: str, namespace: str, pod_name: str, container: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Get the latest logs for a specific pod"""
-        return call_with_timeout(self.aks_provider.get_pod_logs, cluster_id, namespace, pod_name, container=container)
+        """Get the latest logs for a specific pod. Only ever called on an explicit user action
+        (see dashboard/aks.py's "Fetch Latest Logs" button) - never cached, and never part of
+        the AKS Workspace page's normal load."""
+        return call_with_timeout(
+            self.aks_provider.get_pod_logs, cluster_id, namespace, pod_name, container=container,
+            timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS,
+        )
 
     def get_pod_events(self, cluster_id: str, namespace: str, pod_name: str) -> List[Dict[str, Any]]:
         """Get events for a specific pod"""
-        return call_with_timeout(self.aks_provider.get_pod_events, cluster_id, namespace, pod_name)
+        return call_with_timeout(self.aks_provider.get_pod_events, cluster_id, namespace, pod_name, timeout=AKS_RUN_COMMAND_AWARE_TIMEOUT_SECONDS)
+
+    def _invalidate_namespace_scope(self, cluster_id: str, namespace: str) -> None:
+        """Drop this (cluster, namespace)'s cached deployments/ReplicaSets/pods/services/
+        ingress/events - just this scope, not the cluster's namespace list, node list, or any
+        other namespace's cache - so a fresh investigate_namespace() call can never replay an
+        earlier snapshot from this session."""
+        bucket = self._per_resource_cache.get(cluster_id)
+        if not bucket:
+            return
+        for kind in ("aks_deployments", "aks_replicasets", "aks_pods", "aks_services", "aks_ingress", "aks_events"):
+            bucket.pop(f"{kind}:{namespace}", None)
+
+    def investigate_namespace(self, cluster_id: str, namespace: str, max_log_pods: int = 5) -> Dict[str, Any]:
+        """One-click, namespace-scoped investigation: collect deployments, ReplicaSets, pods,
+        services, ingress, and events for `namespace`, run deterministic rule-based issue
+        detection over them (see utils.aks_diagnostics.detect_namespace_issues), and
+        automatically pull logs + events for the unhealthiest pods (bounded by `max_log_pods`,
+        ranked by restart count) - so the caller never has to separately visit the Pods/Pod Logs
+        views to see the evidence behind a finding.
+
+        Always fetches live from the cluster - never reuses this session's cached get_cluster_*()
+        results (see _invalidate_namespace_scope above), even if the same namespace was already
+        browsed via the manual views or investigated before. This is deliberately the one place
+        in the AKS Workspace that trades the session-long cache's speed for a guarantee that
+        "Investigate" always reflects the cluster's current state (new pods, new restarts, a
+        just-finished rollout) - an explicit, infrequent, user-initiated action, unlike the
+        manual views' fetches which happen on every tab switch and would re-pay this cost far
+        more often for comparatively little benefit. Logs/pod-events were already never cached
+        anywhere in this app (see get_pod_logs) and are fetched fresh regardless.
+
+        Degrades per-kind: if one call raises AKSUnreachableError (e.g. ingress unsupported, or
+        this particular kind too large for AKS Run Command's output cap), that kind's evidence
+        stays an empty list and its reason is recorded in `fetch_errors` - it does not fail the
+        whole investigation, but the caller should surface `fetch_errors` so an empty result
+        reads as "couldn't check", not "confirmed healthy".
+
+        Latency: bypassing the cache (above) means every call here is a real AKS round trip -
+        run sequentially, that's up to 6 kind-fetches plus 2 more per unhealthy pod (logs +
+        events, up to `max_log_pods` pods), i.e. up to ~16 round trips back-to-back. Both fetch
+        stages below instead run on a small thread pool
+        (_NAMESPACE_INVESTIGATION_CONCURRENCY, matching the concurrency already proven safe for
+        concurrent AKS Run Command calls elsewhere in this app - see dashboard.aks's
+        run_concurrent_fetches), so wall-clock is roughly (stage size / concurrency) round trips
+        instead of one full round trip per item.
+        """
+        self._invalidate_namespace_scope(cluster_id, namespace)
+
+        evidence: Dict[str, Any] = {"cluster_id": cluster_id, "namespace": namespace}
+        fetch_errors: Dict[str, str] = {}
+
+        def _fetch(key: str, fetch_fn) -> Tuple[str, Any, Optional[str]]:
+            try:
+                return key, fetch_fn(), None
+            except AKSUnreachableError as exc:
+                return key, [], exc.reason
+
+        kind_jobs = {
+            "deployments": lambda: self.get_cluster_deployments(cluster_id, namespace),
+            "replicasets": lambda: self.get_cluster_replicasets(cluster_id, namespace),
+            "pods": lambda: self.get_cluster_pods(cluster_id, namespace),
+            "services": lambda: self.get_cluster_services(cluster_id, namespace),
+            "ingress": lambda: self.get_cluster_ingress(cluster_id, namespace),
+            "events": lambda: self.get_cluster_events(cluster_id, namespace),
+        }
+        with ThreadPoolExecutor(
+            max_workers=_NAMESPACE_INVESTIGATION_CONCURRENCY, thread_name_prefix="aks-ns-investigate",
+        ) as pool:
+            for key, result, error in pool.map(lambda item: _fetch(*item), kind_jobs.items()):
+                evidence[key] = result
+                if error:
+                    fetch_errors[key] = error
+
+        evidence["issues"] = detect_namespace_issues(
+            pods=evidence["pods"],
+            deployments=evidence["deployments"],
+            replicasets=evidence["replicasets"],
+            events=evidence["events"],
+        )
+
+        # Ranked by restart count so the pod actually causing the alarm gets its logs pulled
+        # first if there are more unhealthy pods than max_log_pods allows.
+        unhealthy_pods = sorted(
+            (p for p in evidence["pods"] if not p.get("is_healthy")),
+            key=lambda p: p.get("restart_count", 0) or 0,
+            reverse=True,
+        )[:max_log_pods]
+
+        def _diagnose(pod: Dict[str, Any]) -> Dict[str, Any]:
+            pod_namespace = pod.get("namespace") or namespace
+            pod_name = pod.get("name")
+            containers = pod.get("containers") or []
+            try:
+                logs = self.get_pod_logs(
+                    cluster_id, pod_namespace, pod_name,
+                    container=containers[0] if containers else None,
+                )
+            except AKSUnreachableError as exc:
+                logs = {"error": f"Could not fetch logs: {exc.reason}"}
+            try:
+                pod_events = self.get_pod_events(cluster_id, pod_namespace, pod_name)
+            except AKSUnreachableError:
+                pod_events = []
+            return {"pod": pod, "logs": logs, "events": pod_events}
+
+        if unhealthy_pods:
+            with ThreadPoolExecutor(
+                max_workers=min(_NAMESPACE_INVESTIGATION_CONCURRENCY, len(unhealthy_pods)),
+                thread_name_prefix="aks-ns-pod-diag",
+            ) as pool:
+                evidence["pod_diagnostics"] = list(pool.map(_diagnose, unhealthy_pods))
+        else:
+            evidence["pod_diagnostics"] = []
+
+        evidence["fetch_errors"] = fetch_errors
+        return evidence
 
     def get_cluster_configmaps(self, cluster_id: str, namespace: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get ConfigMaps for a cluster (optionally filtered to one namespace) - names and data keys only."""
@@ -422,6 +606,21 @@ class ResourceService:
         return self._cached(resource_id, "logs", lambda: self.observability_provider.get_logs(
             self._resolve_arm_resource_id(resource_id)
         ))
+
+    def get_live_app_logs(self, default_host_name: str, max_lines: int = 500) -> List[str]:
+        """Get the most recent raw lines from an App Service's own container log file
+        (see providers/azure/app_service_logs.py - read via Kudu VFS, not Log Analytics:
+        this environment has no Log Analytics workspace, confirmed live, so that path
+        returns nothing for any App Service here regardless of query/window).
+
+        Deliberately NOT session-cached: the Live Logs page (dashboard/pages/live_logs.py)
+        re-calls this on every manual/auto refresh specifically to see newly-arrived
+        lines, which a cache would hide until some other cache-invalidating action
+        happened to run first.
+
+        Takes the resource's `defaultHostName` (not an ARM resource ID) - that's what
+        the Kudu VFS host is derived from; see AzureAppServiceLogs._scm_host."""
+        return self.app_service_logs_provider.get_recent_lines(default_host_name, max_lines=max_lines)
 
     def get_resource_cost(self, resource_id: str) -> Optional[Dict[str, Any]]:
         """Get live current/last month cost for a resource. Backed by the application-wide,

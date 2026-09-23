@@ -61,8 +61,15 @@ class AzureLogAnalytics:
             self._client = LogsQueryClient(credential)
         return self._client
 
-    def get_logs(self, resource_id: str, limit: int = _MAX_ROWS) -> List[Dict[str, Any]]:
+    def get_logs(
+        self, resource_id: str, limit: int = _MAX_ROWS, minutes: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """Fetch the most recent log entries for a resource, newest first.
+
+        `minutes`, when given, overrides the default 24h timespan - used by the Live Logs
+        page's 5/15/30/60 min window picker, which needs a tight recent window (24h would
+        return the same 200-row cap dominated by old entries, never the just-happened ones
+        a developer actually wants when live-tailing).
 
         Returns an empty list if the resource has no diagnostic logs flowing into Log
         Analytics (i.e. "No logs available"), or if the query itself fails.
@@ -70,11 +77,12 @@ class AzureLogAnalytics:
         if not resource_id:
             return []
 
+        timespan = timedelta(minutes=minutes) if minutes is not None else _TIMESPAN
         try:
             client = self._get_client()
             with log_timing(logger, "AzureLogAnalytics.get_logs"):
                 response = client.query_resource(
-                    resource_id, _QUERY.format(limit=limit), timespan=_TIMESPAN
+                    resource_id, _QUERY.format(limit=limit), timespan=timespan
                 )
         except Exception as exc:
             logger.error("Log Analytics query failed for %s: %s", resource_id, exc)

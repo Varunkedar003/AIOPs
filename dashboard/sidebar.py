@@ -51,10 +51,16 @@ def render_sidebar() -> Optional[str]:
 
     # Import resource service
     from services.resource_service import ResourceService
+    from dashboard.subscription_picker import SUBSCRIPTIONS, build_auth_for
 
-    # Initialize resource service
+    # Initialize resource service (defensive fallback - app.py already does this before
+    # rendering the sidebar on every page, so this normally never fires. Kept consistent
+    # with app.py's own default (Staging) rather than a bare ResourceService() reading
+    # .env's own default, so this fallback can never silently disagree with the picker.)
     if 'resource_service' not in st.session_state:
-        st.session_state.resource_service = ResourceService()
+        default_sub_id = SUBSCRIPTIONS[0][1]
+        st.session_state.active_subscription_id = default_sub_id
+        st.session_state.resource_service = ResourceService(azure_auth=build_auth_for(default_sub_id))
 
     resource_service = st.session_state.resource_service
 

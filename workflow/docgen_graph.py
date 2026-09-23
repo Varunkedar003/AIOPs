@@ -24,6 +24,7 @@ from docgen.exporters import export_all
 from docgen.renderer import render_documentation_markdown
 from docgen.schemas import ProjectDocumentation
 from docgen.synthesizer import DocumentationSynthesizer
+from utils.k8s_safety import AKSUnreachableError
 from workflow.docgen_state import DocGenState
 
 NODE_DISCOVER = "discover"
@@ -59,7 +60,15 @@ def _make_collect_node(collector: DocumentationCollector):
         if state.get("error"):
             return {"stage": NODE_COLLECT}
         context = state["project_context"]
-        evidence = collector.collect(context)
+        # DocumentationCollector._collect_aks already catches AKSUnreachableError around its own
+        # K8s calls and degrades to an "AKS data unavailable" evidence entry - this is a second,
+        # outer safety net at the workflow boundary so an unreachable cluster can never crash the
+        # whole doc-generation run, even if it surfaces from somewhere collect() doesn't already
+        # guard.
+        try:
+            evidence = collector.collect(context)
+        except AKSUnreachableError as exc:
+            evidence = {"aks": {"agent": "aks_source", "found": False, "unavailable": True, "reason": f"AKS data unavailable: {exc}"}}
         timeline = (state.get("timeline") or []) + ["Collect: gathered live GitLab/Azure/AKS/Monitoring/Cost evidence"]
         return {"stage": NODE_COLLECT, "evidence": evidence, "timeline": timeline}
 

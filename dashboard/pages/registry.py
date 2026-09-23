@@ -7,6 +7,7 @@ from dashboard.pages.monitoring import render_monitoring
 from dashboard.pages.finops import render_finops
 from dashboard.pages.aks_workspace import render_aks_workspace
 from dashboard.pages.gitlab_workspace import render_gitlab_workspace
+from dashboard.pages.live_logs import render_live_logs
 from dashboard.pages.settings import render_settings
 
 INFRASTRUCTURE_EXPLORER = st.Page(
@@ -52,6 +53,12 @@ GITLAB = st.Page(
     icon="🦊",
     url_path="gitlab",
 )
+LIVE_LOGS = st.Page(
+    render_live_logs,
+    title="Live Logs",
+    icon="📜",
+    url_path="live-logs",
+)
 SETTINGS = st.Page(
     render_settings,
     title="Settings",
@@ -67,5 +74,6 @@ ALL_PAGES = [
     FINOPS,
     AKS_WORKSPACE,
     GITLAB,
+    LIVE_LOGS,
     SETTINGS,
 ]

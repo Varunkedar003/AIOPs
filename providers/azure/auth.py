@@ -24,11 +24,20 @@ class AzureAuth:
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
         subscription_id: Optional[str] = None,
+        subscription_ids: Optional[list] = None,
     ):
         self.tenant_id = tenant_id or Config.AZURE_TENANT_ID
         self.client_id = client_id or Config.AZURE_CLIENT_ID
         self.client_secret = client_secret or Config.AZURE_CLIENT_SECRET
-        self.subscription_id = subscription_id or Config.AZURE_SUBSCRIPTION_ID
+        # subscription_ids: the full list to query across (Resource Graph, and anything
+        # else that can natively span subscriptions in one call). subscription_id: the
+        # first entry, kept for SDK clients (AKS's ContainerServiceClient, Cost
+        # Management's per-scope calls) that only ever bind to one subscription at a
+        # time - those loop over subscription_ids themselves and merge results.
+        self.subscription_ids = subscription_ids or Config.AZURE_SUBSCRIPTION_IDS or (
+            [subscription_id] if subscription_id else []
+        )
+        self.subscription_id = subscription_id or (self.subscription_ids[0] if self.subscription_ids else "")
         self._credential: Optional[ClientSecretCredential] = None
 
     def is_configured(self) -> bool:

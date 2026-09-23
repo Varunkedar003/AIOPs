@@ -59,9 +59,9 @@ class MockObservabilityProvider(BaseProvider):
         """Get live Azure Resource Health status for a specific resource"""
         return self._alerts.get_resource_health(resource_id)
 
-    def get_logs(self, resource_id: str) -> List[Dict[str, Any]]:
+    def get_logs(self, resource_id: str, minutes: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get live Log Analytics logs for a specific resource. Empty if none available."""
-        return self._log_analytics.get_logs(resource_id)
+        return self._log_analytics.get_logs(resource_id, minutes=minutes)
 
     def get_application_insights(self, resource_id: str) -> Optional[Dict[str, Any]]:
         """Get Application Insights data for a resource"""

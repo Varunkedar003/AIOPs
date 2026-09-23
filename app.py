@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 from dashboard import render_sidebar
-from dashboard.pages.registry import ALL_PAGES, INFRASTRUCTURE_EXPLORER, AKS_WORKSPACE, GITLAB, FINOPS
+from dashboard.pages.registry import ALL_PAGES, INFRASTRUCTURE_EXPLORER, AKS_WORKSPACE, GITLAB, FINOPS, LIVE_LOGS
+from dashboard.subscription_picker import render_subscription_picker, build_auth_for, SUBSCRIPTIONS
 from services.resource_service import ResourceService
 
 # Initialize session state
@@ -26,7 +27,13 @@ if 'navigation_history' not in st.session_state:
 if 'history_index' not in st.session_state:
     st.session_state.history_index = -1
 if 'resource_service' not in st.session_state:
-    st.session_state.resource_service = ResourceService()
+    # Defaults to Staging (SUBSCRIPTIONS[0]) regardless of .env's own default - this is a
+    # developer-facing tool and staging is where day-to-day investigation happens; see
+    # dashboard/subscription_picker.py for why switching to Production is a deliberate,
+    # explicit action instead.
+    _default_sub_id = SUBSCRIPTIONS[0][1]
+    st.session_state.active_subscription_id = _default_sub_id
+    st.session_state.resource_service = ResourceService(azure_auth=build_auth_for(_default_sub_id))
 
 st.set_page_config(
     page_title="AIOps Commander",
@@ -37,19 +44,24 @@ st.set_page_config(
 
 pg = st.navigation(ALL_PAGES)
 
-# Azure Subscription Explorer sidebar: available on every page except the Infrastructure
-# Explorer home page (which shows the full topology instead), the AKS/GitLab workspaces
-# (which have their own dedicated cluster/project picker and don't need a second, unrelated
-# resource tree alongside it), and FinOps (a subscription-wide cost/utilization view - the
-# resource tree isn't part of its workflow and only crowded the page).
-NO_SIDEBAR_PAGES = (INFRASTRUCTURE_EXPLORER, AKS_WORKSPACE, GITLAB, FINOPS)
-if not any(pg is page for page in NO_SIDEBAR_PAGES):
-    with st.sidebar:
-        st.markdown("# AIOps Commander")
-        st.caption("AI Powered Cloud Operations Platform")
-        st.markdown("---")
+# Azure Subscription Explorer resource tree: available on every page except the
+# Infrastructure Explorer home page (which shows the full topology instead), the
+# AKS/GitLab workspaces (which have their own dedicated cluster/project picker and don't
+# need a second, unrelated resource tree alongside it), and FinOps (a subscription-wide
+# cost/utilization view - the resource tree isn't part of its workflow and only crowded
+# the page). The subscription picker itself is NOT gated by this - it needs to be
+# reachable from every page, including the ones above, or switching away from Staging
+# would only be possible from some pages and not others.
+NO_RESOURCE_TREE_PAGES = (INFRASTRUCTURE_EXPLORER, AKS_WORKSPACE, GITLAB, FINOPS, LIVE_LOGS)
+with st.sidebar:
+    st.markdown("# AIOps Commander")
+    st.caption("AI Powered Cloud Operations Platform")
+    st.markdown("---")
+    render_subscription_picker()
+    st.markdown("---")
+    if not any(pg is page for page in NO_RESOURCE_TREE_PAGES):
         render_sidebar()
         st.markdown("---")
-        st.caption("v0.1 Local Development")
+    st.caption("v0.1 Local Development")
 
 pg.run()
